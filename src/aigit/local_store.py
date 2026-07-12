@@ -5,12 +5,21 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import tempfile
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Iterator
 
 from aigit.canonical import canonical_json, hash_bytes
 from aigit.domain import Event
+
+
+class BlobIntegrityError(RuntimeError):
+    """Raised when blob bytes do not match their content-addressed digest."""
+
+
+class EventCollisionError(ValueError):
+    """Raised when an event ID is reused for different request content."""
 
 
 def event_hash(event_dict: dict[str, object]) -> str:
@@ -39,6 +48,16 @@ class LocalStore:
         appended = False
         try:
             connection.execute("BEGIN IMMEDIATE")
+            existing = self._find_event(event.event_id)
+            if existing is not None:
+                if self._request_content(existing) != self._request_content(asdict(event)):
+                    raise EventCollisionError(
+                        f"event_id {event.event_id} already has different content"
+                    )
+                self._replace_sequences_from_ledger(connection)
+                connection.commit()
+                return Event(**existing)
+
             row = connection.execute(
                 "SELECT sequence, event_hash FROM sequences WHERE repo_id = ?",
                 (event.repo_id,),
@@ -129,19 +148,51 @@ class LocalStore:
         hexadecimal = digest.removeprefix("sha256:")
         destination = self.blobs_path / hexadecimal[:2] / hexadecimal[2:]
         destination.parent.mkdir(parents=True, exist_ok=True)
+
+        corrupt_existing = False
         try:
-            with destination.open("xb") as blob:
+            existing = destination.read_bytes()
+        except FileNotFoundError:
+            pass
+        else:
+            if hash_bytes(existing) == digest:
+                return digest
+            corrupt_existing = True
+
+        temporary_path: Path | None = None
+        try:
+            descriptor, temporary_name = tempfile.mkstemp(
+                dir=destination.parent,
+                prefix=f".{destination.name}.",
+                suffix=".tmp",
+            )
+            temporary_path = Path(temporary_name)
+            with os.fdopen(descriptor, "wb") as blob:
                 blob.write(data)
                 blob.flush()
                 os.fsync(blob.fileno())
-        except FileExistsError:
-            pass
+            os.replace(temporary_path, destination)
+        except OSError as exc:
+            if corrupt_existing:
+                raise BlobIntegrityError(
+                    f"could not replace corrupt blob {digest}"
+                ) from exc
+            raise
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
         return digest
 
     def get_blob(self, digest: str) -> bytes:
         """Retrieve bytes previously stored under a SHA-256 digest."""
         hexadecimal = self._digest_hexadecimal(digest)
-        return (self.blobs_path / hexadecimal[:2] / hexadecimal[2:]).read_bytes()
+        data = (self.blobs_path / hexadecimal[:2] / hexadecimal[2:]).read_bytes()
+        actual = hash_bytes(data)
+        if actual != digest:
+            raise BlobIntegrityError(
+                f"blob digest mismatch: expected {digest}, found {actual}"
+            )
+        return data
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.database_path, timeout=30)
@@ -189,33 +240,59 @@ class LocalStore:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            connection.execute("DELETE FROM sequences")
-            for record in self._ledger_records():
-                repo_id = record.get("repo_id")
-                sequence = record.get("sequence")
-                digest = record.get("event_hash")
-                if (
-                    not isinstance(repo_id, str)
-                    or not isinstance(sequence, int)
-                    or not isinstance(digest, str)
-                ):
-                    continue
-                connection.execute(
-                    """
-                    INSERT INTO sequences (repo_id, sequence, event_hash)
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(repo_id) DO UPDATE SET
-                        sequence = excluded.sequence,
-                        event_hash = excluded.event_hash
-                    """,
-                    (repo_id, sequence, digest),
-                )
+            self._replace_sequences_from_ledger(connection)
             connection.commit()
         except BaseException:
             connection.rollback()
             raise
         finally:
             connection.close()
+
+    def _replace_sequences_from_ledger(
+        self, connection: sqlite3.Connection
+    ) -> None:
+        connection.execute("DELETE FROM sequences")
+        for record in self._ledger_records():
+            repo_id = record.get("repo_id")
+            sequence = record.get("sequence")
+            digest = record.get("event_hash")
+            if (
+                not isinstance(repo_id, str)
+                or not isinstance(sequence, int)
+                or not isinstance(digest, str)
+            ):
+                continue
+            connection.execute(
+                """
+                INSERT INTO sequences (repo_id, sequence, event_hash)
+                VALUES (?, ?, ?)
+                ON CONFLICT(repo_id) DO UPDATE SET
+                    sequence = excluded.sequence,
+                    event_hash = excluded.event_hash
+                """,
+                (repo_id, sequence, digest),
+            )
+
+    def _find_event(self, event_id: str) -> dict[str, Any] | None:
+        for record in self._ledger_records():
+            if record.get("event_id") == event_id:
+                return record
+        return None
+
+    @staticmethod
+    def _request_content(event_dict: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: event_dict.get(key)
+            for key in (
+                "schema_version",
+                "event_id",
+                "event_type",
+                "repo_id",
+                "session_id",
+                "observed_at",
+                "payload",
+            )
+        }
 
     def _ledger_records(self) -> Iterator[dict[str, Any]]:
         if not self.ledger_path.exists():
