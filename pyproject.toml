@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aigit-design"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["fastapi==0.115.*", "httpx==0.28.*", "uvicorn==0.34.*"]
+
+[project.optional-dependencies]
+test = ["pytest==8.3.*", "pytest-cov==6.0.*"]
+
+[project.scripts]
+aigit = "aigit.cli:main"
+aigit-server = "aigit_server.app:main"
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]
