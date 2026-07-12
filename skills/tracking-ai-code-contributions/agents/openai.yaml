@@ -1,0 +1,4 @@
+﻿interface:
+  display_name: "AI 代码贡献归因"
+  short_description: "记录 AI 实际应用 patch，按证据统计代码来源"
+  default_prompt: "使用 $tracking-ai-code-contributions 自动记录并归类本次代码变更，不给开发者增加步骤。"
