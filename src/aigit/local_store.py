@@ -50,7 +50,9 @@ class LocalStore:
             connection.execute("BEGIN IMMEDIATE")
             existing = self._find_event(event.event_id)
             if existing is not None:
-                if self._request_content(existing) != self._request_content(asdict(event)):
+                existing_request = canonical_json(self._request_content(existing))
+                incoming_request = canonical_json(self._request_content(asdict(event)))
+                if existing_request != incoming_request:
                     raise EventCollisionError(
                         f"event_id {event.event_id} already has different content"
                     )
@@ -284,12 +286,9 @@ class LocalStore:
         return {
             key: event_dict.get(key)
             for key in (
-                "schema_version",
-                "event_id",
-                "event_type",
                 "repo_id",
                 "session_id",
-                "observed_at",
+                "event_type",
                 "payload",
             )
         }

@@ -152,3 +152,16 @@ def test_append_rejects_event_id_reused_with_different_request_content(
         store.append(replace(event, payload={"healthy": False}))
 
     assert len(store.ledger_path.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_append_distinguishes_boolean_and_integer_collision_payloads(
+    tmp_path,
+) -> None:
+    store = LocalStore(tmp_path)
+    event = Event.new("repo-1", "s-1", "heartbeat", {"value": True})
+    store.append(event)
+
+    with pytest.raises(EventCollisionError, match=event.event_id):
+        store.append(replace(event, payload={"value": 1}))
+
+    assert len(store.ledger_path.read_text(encoding="utf-8").splitlines()) == 1
