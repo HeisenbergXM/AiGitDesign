@@ -95,6 +95,7 @@ class Observer:
                 )
             )
             self._started = True
+            initial_fence = self._current_sequence()
             try:
                 snapshot = capture_snapshot(self.repository, self.store)
             except Exception:
@@ -104,7 +105,7 @@ class Observer:
                         snapshot,
                         observed_at,
                         observed_at,
-                        self._current_sequence(),
+                        initial_fence,
                         self._current_sequence(),
                         True,
                     )
@@ -127,7 +128,37 @@ class Observer:
                         snapshot,
                         observed_at,
                         observed_at,
+                        initial_fence,
                         self._current_sequence(),
+                        True,
+                    )
+                )
+                return emitted
+            post_capture_fence = self._current_sequence()
+            if self._transaction_event_between(
+                initial_fence,
+                post_capture_fence,
+            ):
+                snapshot = _unknown_startup_snapshot()
+                emitted.append(
+                    self._emit(
+                        "recovery_detected",
+                        self._unknown_recovery_payload(
+                            snapshot,
+                            reason_code="STARTUP_TRANSACTION_RACE",
+                        ),
+                        observed_at,
+                    )
+                )
+                emitted.append(
+                    self._heartbeat(snapshot, observed_at, healthy=False)
+                )
+                self._save_state(
+                    _ObserverState(
+                        snapshot,
+                        observed_at,
+                        observed_at,
+                        initial_fence,
                         self._current_sequence(),
                         True,
                     )
@@ -139,7 +170,7 @@ class Observer:
                     snapshot,
                     observed_at,
                     observed_at,
-                    self._current_sequence(),
+                    post_capture_fence,
                     self._current_sequence(),
                     False,
                 )

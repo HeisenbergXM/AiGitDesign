@@ -579,6 +579,73 @@ def test_startup_capture_failure_is_durable_unknown_until_recovery(
     assert _events_of_type(recovered, "workspace_edit") == []
 
 
+def test_initial_capture_transaction_before_state_save_is_reconciled_not_manual(
+    repo: Path,
+    state_root: Path,
+    clock: FakeClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observer = Observer(repo, state_root=state_root)
+    recorder = Recorder(repo, state_root)
+    real_heartbeat = observer._heartbeat
+    transaction_completed = False
+
+    def complete_transaction_before_initial_state_save(
+        snapshot: GitSnapshot,
+        now: datetime,
+        *,
+        healthy: bool = True,
+    ) -> Event:
+        nonlocal transaction_completed
+        if not transaction_completed:
+            transaction_completed = True
+            transaction_id = str(
+                recorder.begin("agent-during-initial-save")["transaction_id"]
+            )
+            (repo / "app.py").write_text(
+                "committed = 0\nai_after_initial_capture = 1\n",
+                encoding="utf-8",
+            )
+            assert recorder.end(transaction_id, "passed")["ok"] is True
+        return real_heartbeat(snapshot, now, healthy=healthy)
+
+    monkeypatch.setattr(
+        observer,
+        "_heartbeat",
+        complete_transaction_before_initial_state_save,
+    )
+
+    startup = observer.tick(clock.now())
+
+    assert transaction_completed is True
+    assert _events_of_type(startup, "workspace_edit") == []
+    monkeypatch.setattr(observer, "_heartbeat", real_heartbeat)
+    clock.advance(seconds=10)
+    restarted = Observer(repo, state_root=state_root)
+    restart_tick = restarted.tick(clock.now())
+
+    assert [
+        event
+        for event in restart_tick
+        if event.event_type in {"workspace_edit", "recovery_detected"}
+        and event.payload.get("path") == "app.py"
+    ] == []
+    observer_path_events = [
+        record
+        for record in _ledger_records(repo, state_root)
+        if record["session_id"] == "observer"
+        and record["event_type"] in {"workspace_edit", "recovery_detected"}
+        and record["payload"].get("path") == "app.py"
+    ]
+    assert observer_path_events == []
+    transaction_patches = [
+        record
+        for record in _ledger_records(repo, state_root)
+        if record["event_type"] == "patch_applied"
+    ]
+    assert len(transaction_patches) == 1
+
+
 def test_restart_replays_durable_contribution_boundary_without_double_counting(
     observer: Observer,
     clock: FakeClock,
