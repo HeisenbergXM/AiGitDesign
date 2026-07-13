@@ -117,31 +117,23 @@ def _reuse_confidence(
     return best if best >= 0.85 else None
 
 
-def _classify_span(span: PatchSpan, context: ClassificationContext) -> PatchSpan:
+def _classify_without_prompt(
+    span: PatchSpan,
+    context: ClassificationContext,
+) -> PatchSpan:
     destination = _metric_lines(span.new_lines)
 
-    if destination and context.prompt_evidence.overlaps(destination):
-        return replace(span, classification=Classification.USER_SUPPLIED, confidence=1.0)
-
-    removed = _removed_source(span, context)
-    if removed is not None:
-        source, action = removed
-        return replace(span, classification=source.origin, action=action, confidence=1.0)
-
     if context.in_transaction and destination:
-        action = ActionKind.ADDED if span.action is ActionKind.MOVED else span.action
         confidence = _reuse_confidence(destination, context.repository_blocks)
         if confidence is not None:
             return replace(
                 span,
                 classification=Classification.AI_REUSED,
-                action=action,
                 confidence=confidence,
             )
         return replace(
             span,
             classification=Classification.AI_SKILL,
-            action=action,
             confidence=1.0,
         )
 
@@ -151,10 +143,100 @@ def _classify_span(span: PatchSpan, context: ClassificationContext) -> PatchSpan
     return replace(span, classification=Classification.UNKNOWN, confidence=0.0)
 
 
+def _added_subspan(span: PatchSpan, start: int, end: int) -> PatchSpan:
+    return replace(
+        span,
+        new_start=span.new_start + start,
+        new_end=span.new_start + end,
+        new_lines=span.new_lines[start:end],
+    )
+
+
+def _split_added_prompt_overlap(
+    span: PatchSpan,
+    ranges: tuple[tuple[int, int], ...],
+    context: ClassificationContext,
+) -> list[PatchSpan]:
+    result: list[PatchSpan] = []
+    position = 0
+    for start, end in ranges:
+        if position < start:
+            result.append(
+                _classify_without_prompt(
+                    _added_subspan(span, position, start),
+                    context,
+                )
+            )
+        result.append(
+            replace(
+                _added_subspan(span, start, end),
+                classification=Classification.USER_SUPPLIED,
+                confidence=1.0,
+            )
+        )
+        position = end
+
+    if position < len(span.new_lines):
+        result.append(
+            _classify_without_prompt(
+                _added_subspan(span, position, len(span.new_lines)),
+                context,
+            )
+        )
+    return result
+
+
+def _classify_span(
+    span: PatchSpan,
+    context: ClassificationContext,
+) -> list[PatchSpan]:
+    destination = _metric_lines(span.new_lines)
+    prompt_ranges = context.prompt_evidence.matching_ranges(span.new_lines)
+
+    if prompt_ranges == ((0, len(span.new_lines)),):
+        return [
+            replace(
+                span,
+                classification=Classification.USER_SUPPLIED,
+                confidence=1.0,
+            )
+        ]
+
+    removed = _removed_source(span, context)
+    if removed is not None:
+        source, action = removed
+        return [
+            replace(
+                span,
+                classification=source.origin,
+                action=action,
+                confidence=1.0,
+            )
+        ]
+
+    effective_span = (
+        replace(span, action=ActionKind.ADDED)
+        if span.action is ActionKind.MOVED
+        else span
+    )
+    if prompt_ranges:
+        if effective_span.action is ActionKind.ADDED:
+            return _split_added_prompt_overlap(effective_span, prompt_ranges, context)
+        return [
+            replace(
+                effective_span,
+                classification=Classification.UNKNOWN,
+                confidence=0.0,
+            )
+        ]
+
+    return [_classify_without_prompt(effective_span, context)]
+
+
 def classify_spans(
     spans: Iterable[PatchSpan],
     context: ClassificationContext,
 ) -> list[PatchSpan]:
     """Classify spans according to the approved, uncertainty-preserving order."""
 
-    return [_classify_span(span, context) for span in spans]
+    return [classified for span in spans for classified in _classify_span(span, context)]

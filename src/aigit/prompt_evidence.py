@@ -42,17 +42,66 @@ class PromptEvidence:
     fingerprints: tuple[str, ...]
     counts: tuple[int, ...]
     _key: bytes = field(repr=False, compare=False)
+    _line_fingerprints: tuple[tuple[str, ...], ...] = field(
+        repr=False,
+        compare=False,
+    )
+
+    def matching_ranges(self, lines: Iterable[str]) -> tuple[tuple[int, int], ...]:
+        """Return maximal candidate line ranges present contiguously in prompts."""
+
+        normalized = _normalize_lines(lines)
+        indexed_candidate = tuple(
+            (index, _line_fingerprint(line, self._key))
+            for index, line in enumerate(normalized)
+            if line
+        )
+        if not indexed_candidate:
+            return ()
+
+        candidate_fingerprints = tuple(item[1] for item in indexed_candidate)
+        matches: list[tuple[int, int]] = []
+        for prompt_fingerprints in self._line_fingerprints:
+            for candidate_start, candidate_fingerprint in enumerate(candidate_fingerprints):
+                for prompt_start, prompt_fingerprint in enumerate(prompt_fingerprints):
+                    if not hmac.compare_digest(candidate_fingerprint, prompt_fingerprint):
+                        continue
+                    length = 0
+                    while (
+                        candidate_start + length < len(candidate_fingerprints)
+                        and prompt_start + length < len(prompt_fingerprints)
+                        and hmac.compare_digest(
+                            candidate_fingerprints[candidate_start + length],
+                            prompt_fingerprints[prompt_start + length],
+                        )
+                    ):
+                        length += 1
+                    raw_start = indexed_candidate[candidate_start][0]
+                    raw_end = indexed_candidate[candidate_start + length - 1][0] + 1
+                    while raw_start > 0 and not normalized[raw_start - 1]:
+                        raw_start -= 1
+                    while raw_end < len(normalized) and not normalized[raw_end]:
+                        raw_end += 1
+                    matches.append((raw_start, raw_end))
+
+        if not matches:
+            return ()
+
+        maximal: list[tuple[int, int]] = []
+        for start, end in sorted(matches):
+            if maximal and start <= maximal[-1][1]:
+                previous_start, previous_end = maximal[-1]
+                maximal[-1] = (previous_start, max(previous_end, end))
+            else:
+                maximal.append((start, end))
+        return tuple(maximal)
 
     def overlaps(self, lines: Iterable[str]) -> bool:
-        candidate = _metric_lines(lines)
-        for fingerprint, count in zip(self.fingerprints, self.counts, strict=True):
-            if count == 0 or count > len(candidate):
-                continue
-            for start in range(len(candidate) - count + 1):
-                block = candidate[start : start + count]
-                if hmac.compare_digest(_fingerprint(block, self._key), fingerprint):
-                    return True
-        return False
+        return bool(self.matching_ranges(lines))
+
+
+def _line_fingerprint(line: str, key: bytes) -> str:
+    return hmac.new(key, b"line\0" + line.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def build_prompt_evidence(
@@ -66,11 +115,18 @@ def build_prompt_evidence(
 
     fingerprints: list[str] = []
     counts: list[int] = []
+    line_fingerprints: list[tuple[str, ...]] = []
     for code_block in code_blocks:
         normalized = _metric_lines(code_block)
         if not normalized:
             continue
         fingerprints.append(_fingerprint(normalized, key))
         counts.append(len(normalized))
+        line_fingerprints.append(tuple(_line_fingerprint(line, key) for line in normalized))
 
-    return PromptEvidence(tuple(fingerprints), tuple(counts), bytes(key))
+    return PromptEvidence(
+        tuple(fingerprints),
+        tuple(counts),
+        bytes(key),
+        tuple(line_fingerprints),
+    )
