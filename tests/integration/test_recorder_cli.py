@@ -77,10 +77,50 @@ def _evidence_hmac(value: bytes) -> str:
     return hmac.new(EVIDENCE_HMAC_KEY, value, hashlib.sha256).hexdigest()
 
 
+def proposed_hunk(
+    *,
+    action: str,
+    path: str,
+    old_start: int,
+    old_end: int,
+    new_start: int,
+    new_end: int,
+    old_lines: tuple[str, ...] = (),
+    new_lines: tuple[str, ...] = (),
+    old_path: str | None = None,
+) -> dict[str, object]:
+    def path_fingerprint(value: str) -> str:
+        normalized = value.replace("\\", "/")
+        return _evidence_hmac(b"path\0" + normalized.encode("utf-8"))
+
+    def line_fingerprints(lines: tuple[str, ...]) -> list[str]:
+        return [
+            _evidence_hmac(b"line\0" + line.encode("utf-8"))
+            for line in lines
+        ]
+
+    return {
+        "action": action,
+        "path_hmac": path_fingerprint(path),
+        "old_path_hmac": (
+            path_fingerprint(old_path) if old_path is not None else None
+        ),
+        "old_start": old_start,
+        "old_end": old_end,
+        "new_start": new_start,
+        "new_end": new_end,
+        "old_line_fingerprints": line_fingerprints(old_lines),
+        "new_line_fingerprints": line_fingerprints(new_lines),
+    }
+
+
 def evidence_payload(
     *,
     prompt_lines: tuple[str, ...] = (),
     applied_lines: tuple[str, ...] = (),
+    proposed_hunks: tuple[dict[str, object], ...] | None = None,
+    applied_path: str = "dirty.py",
+    applied_new_start: int = 0,
 ) -> dict[str, object]:
     def block_fingerprint(lines: tuple[str, ...]) -> str:
         return _evidence_hmac("\n".join(lines).encode("utf-8"))
@@ -90,6 +130,19 @@ def evidence_payload(
             _evidence_hmac(b"line\0" + line.encode("utf-8"))
             for line in lines
         ]
+
+    if proposed_hunks is None and applied_lines:
+        proposed_hunks = (
+            proposed_hunk(
+                action="ADDED",
+                path=applied_path,
+                old_start=applied_new_start,
+                old_end=applied_new_start,
+                new_start=applied_new_start,
+                new_end=applied_new_start + len(applied_lines),
+                new_lines=applied_lines,
+            ),
+        )
 
     return {
         "fingerprints": [block_fingerprint(prompt_lines)] if prompt_lines else [],
@@ -101,17 +154,7 @@ def evidence_payload(
         "normalized_token_count": sum(
             len(line.split()) for line in prompt_lines
         ),
-        "applied_patch_fingerprints": (
-            [block_fingerprint(applied_lines)] if applied_lines else []
-        ),
-        "applied_patch_counts": [len(applied_lines)] if applied_lines else [],
-        "applied_patch_line_fingerprints": (
-            [line_fingerprints(applied_lines)] if applied_lines else []
-        ),
-        "applied_patch_normalized_line_count": len(applied_lines),
-        "applied_patch_normalized_token_count": sum(
-            len(line.split()) for line in applied_lines
-        ),
+        "proposed_patch_hunks": list(proposed_hunks or ()),
     }
 
 
@@ -122,6 +165,9 @@ def begin_with_evidence(
     *,
     applied_lines: tuple[str, ...] = (),
     prompt_lines: tuple[str, ...] = (),
+    proposed_hunks: tuple[dict[str, object], ...] | None = None,
+    applied_path: str = "dirty.py",
+    applied_new_start: int = 0,
 ) -> tuple[subprocess.CompletedProcess[str], dict[str, object]]:
     evidence = Path(cli_env["AIGIT_STATE_DIR"]).parent / f"{session}-evidence.json"
     evidence.write_text(
@@ -129,6 +175,9 @@ def begin_with_evidence(
             evidence_payload(
                 prompt_lines=prompt_lines,
                 applied_lines=applied_lines,
+                proposed_hunks=proposed_hunks,
+                applied_path=applied_path,
+                applied_new_start=applied_new_start,
             )
         ),
         encoding="utf-8",
@@ -180,6 +229,7 @@ def test_cli_records_only_net_applied_patch(
         repo,
         "s-1",
         applied_lines=("ai = 2",),
+        applied_new_start=1,
     )
     assert begin_result.returncode == 0
     (repo / "dirty.py").write_text("manual = 1\nai = 2\n", encoding="utf-8")
@@ -218,6 +268,7 @@ def test_second_begin_reports_active_transaction_without_touching_worktree(
         repo,
         "s-2",
         applied_lines=("recorded = 2",),
+        applied_new_start=1,
     )
 
     assert second_result.returncode == 0
@@ -257,6 +308,7 @@ def test_abort_clears_transaction_without_recording_its_patch(
         repo,
         "s-2",
         applied_lines=("recorded = 2",),
+        applied_new_start=1,
     )
     assert second_result.returncode == 0
     (repo / "dirty.py").write_text(
@@ -431,6 +483,82 @@ def test_parser_level_begin_failure_always_deletes_prompt_evidence(
     assert result.returncode != 0
     assert payload["error"] == "INVALID_ARGUMENT"
     assert not evidence.exists()
+
+
+def test_missing_evidence_value_does_not_delete_option_named_unrelated_file(
+    repo: Path,
+    cli_env: dict[str, str],
+    tmp_path: Path,
+) -> None:
+    unrelated = tmp_path / "--repo"
+    unrelated.write_text("unrelated file must survive", encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "aigit.cli",
+            "begin",
+            "--session",
+            "s-1",
+            "--prompt-evidence",
+            "--repo",
+            str(repo),
+            "--json",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=cli_env,
+        cwd=tmp_path,
+    )
+
+    payload = json.loads(result.stdout)
+    assert result.returncode != 0
+    assert payload["error"] == "INVALID_ARGUMENT"
+    assert unrelated.read_text(encoding="utf-8") == "unrelated file must survive"
+
+
+@pytest.mark.parametrize("equals_first", [False, True])
+def test_parser_failure_deletes_every_duplicate_evidence_file(
+    repo: Path,
+    cli_env: dict[str, str],
+    tmp_path: Path,
+    equals_first: bool,
+) -> None:
+    first = tmp_path / "first-evidence.json"
+    second = tmp_path / "second-evidence.json"
+    first.write_text(json.dumps(evidence_payload()), encoding="utf-8")
+    second.write_text(json.dumps(evidence_payload()), encoding="utf-8")
+    separate = ["--prompt-evidence", str(first)]
+    equals = [f"--prompt-evidence={second}"]
+    evidence_arguments = equals + separate if equals_first else separate + equals
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "aigit.cli",
+            "begin",
+            "--repo",
+            str(repo),
+            "--session",
+            "s-duplicate",
+            *evidence_arguments,
+            "unexpected-extra-argument",
+            "--json",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=cli_env,
+    )
+
+    payload = json.loads(result.stdout)
+    assert result.returncode != 0
+    assert payload["error"] == "INVALID_ARGUMENT"
+    assert not first.exists()
+    assert not second.exists()
 
 
 def test_recorder_constructor_lock_is_fail_open_in_under_500_ms(

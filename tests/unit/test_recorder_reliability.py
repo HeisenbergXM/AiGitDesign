@@ -14,6 +14,7 @@ import pytest
 
 import aigit.cli as cli_module
 import aigit.recorder as recorder_module
+from aigit.domain import Classification, GitSnapshot, PatchSpan
 from aigit.recorder import InvalidRecorderInput, Recorder, RecorderStateError
 
 
@@ -401,6 +402,15 @@ def _line_hmac(line: str) -> str:
     ).hexdigest()
 
 
+def _path_hmac(path: str) -> str:
+    normalized = path.replace("\\", "/")
+    return hmac.new(
+        PROMPT_HMAC_KEY,
+        b"path\0" + normalized.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
 def _block_hmac(lines: list[str]) -> str:
     return hmac.new(
         PROMPT_HMAC_KEY,
@@ -409,12 +419,57 @@ def _block_hmac(lines: list[str]) -> str:
     ).hexdigest()
 
 
+def _proposed_hunk(
+    *,
+    action: str,
+    path: str,
+    old_start: int,
+    old_end: int,
+    new_start: int,
+    new_end: int,
+    old_lines: list[str] | None = None,
+    new_lines: list[str] | None = None,
+    old_path: str | None = None,
+) -> dict[str, object]:
+    return {
+        "action": action,
+        "path_hmac": _path_hmac(path),
+        "old_path_hmac": _path_hmac(old_path) if old_path is not None else None,
+        "old_start": old_start,
+        "old_end": old_end,
+        "new_start": new_start,
+        "new_end": new_end,
+        "old_line_fingerprints": [
+            _line_hmac(line) for line in (old_lines or [])
+        ],
+        "new_line_fingerprints": [
+            _line_hmac(line) for line in (new_lines or [])
+        ],
+    }
+
+
 def _valid_evidence(
     prompt_lines: list[str] | None = None,
     applied_lines: list[str] | None = None,
+    *,
+    proposed_hunks: list[dict[str, object]] | None = None,
+    applied_path: str = "tracked.py",
+    applied_new_start: int = 0,
 ) -> dict[str, object]:
     prompt_lines = prompt_lines or []
     applied_lines = applied_lines or []
+    if proposed_hunks is None and applied_lines:
+        proposed_hunks = [
+            _proposed_hunk(
+                action="ADDED",
+                path=applied_path,
+                old_start=applied_new_start,
+                old_end=applied_new_start,
+                new_start=applied_new_start,
+                new_end=applied_new_start + len(applied_lines),
+                new_lines=applied_lines,
+            )
+        ]
     return {
         "fingerprints": [_block_hmac(prompt_lines)] if prompt_lines else [],
         "counts": [len(prompt_lines)] if prompt_lines else [],
@@ -425,17 +480,7 @@ def _valid_evidence(
         "normalized_token_count": sum(
             len(line.split()) for line in prompt_lines
         ),
-        "applied_patch_fingerprints": (
-            [_block_hmac(applied_lines)] if applied_lines else []
-        ),
-        "applied_patch_counts": [len(applied_lines)] if applied_lines else [],
-        "applied_patch_line_fingerprints": (
-            [[_line_hmac(line) for line in applied_lines]] if applied_lines else []
-        ),
-        "applied_patch_normalized_line_count": len(applied_lines),
-        "applied_patch_normalized_token_count": sum(
-            len(line.split()) for line in applied_lines
-        ),
+        "proposed_patch_hunks": proposed_hunks or [],
     }
 
 
@@ -445,15 +490,36 @@ def _begin_with_evidence(
     *,
     applied_lines: list[str] | None = None,
     prompt_lines: list[str] | None = None,
+    proposed_hunks: list[dict[str, object]] | None = None,
+    applied_path: str = "tracked.py",
+    applied_new_start: int = 0,
 ) -> dict[str, object]:
     evidence_path = (
         recorder.store.state_path.parent / f"{session_id}-prompt-evidence.json"
     )
     evidence_path.write_text(
-        json.dumps(_valid_evidence(prompt_lines, applied_lines)),
+        json.dumps(
+            _valid_evidence(
+                prompt_lines,
+                applied_lines,
+                proposed_hunks=proposed_hunks,
+                applied_path=applied_path,
+                applied_new_start=applied_new_start,
+            )
+        ),
         encoding="utf-8",
     )
     return recorder.begin(session_id, evidence_path)
+
+
+def _replace_first_hunk_field(
+    value: dict[str, object],
+    field: str,
+    replacement: object,
+) -> dict[str, object]:
+    hunks = [dict(hunk) for hunk in value["proposed_patch_hunks"]]
+    hunks[0][field] = replacement
+    return {**value, "proposed_patch_hunks": hunks}
 
 
 @pytest.mark.parametrize(
@@ -471,34 +537,44 @@ def _begin_with_evidence(
         pytest.param(lambda value: {**value, "normalized_line_count": 2}, id="total-line-count-mismatch"),
         pytest.param(lambda value: {**value, "normalized_token_count": True}, id="token-count-type"),
         pytest.param(
-            lambda value: {**value, "applied_patch_fingerprints": "not-a-list"},
-            id="applied-fingerprints-shape",
+            lambda value: {**value, "proposed_patch_hunks": "not-a-list"},
+            id="proposed-hunks-shape",
         ),
         pytest.param(
-            lambda value: {**value, "applied_patch_fingerprints": ["f" * 63]},
-            id="applied-fingerprint-sha256",
+            lambda value: _replace_first_hunk_field(value, "action", "COPIED"),
+            id="hunk-action-enum",
         ),
         pytest.param(
-            lambda value: {**value, "applied_patch_counts": [1]},
-            id="applied-count-cardinality",
+            lambda value: _replace_first_hunk_field(value, "path_hmac", "f" * 63),
+            id="hunk-path-hmac",
         ),
         pytest.param(
-            lambda value: {**value, "applied_patch_line_fingerprints": [["xyz"]]},
-            id="applied-line-hmac-sha256",
+            lambda value: _replace_first_hunk_field(value, "old_path_hmac", "raw.py"),
+            id="hunk-old-path-hmac",
         ),
         pytest.param(
-            lambda value: {
-                **value,
-                "applied_patch_normalized_line_count": 1,
-            },
-            id="applied-total-line-count-mismatch",
+            lambda value: _replace_first_hunk_field(value, "new_start", True),
+            id="hunk-coordinate-type",
         ),
         pytest.param(
-            lambda value: {
-                **value,
-                "applied_patch_normalized_token_count": True,
-            },
-            id="applied-token-count-type",
+            lambda value: _replace_first_hunk_field(value, "new_end", 2),
+            id="hunk-coordinate-line-count",
+        ),
+        pytest.param(
+            lambda value: _replace_first_hunk_field(
+                value,
+                "new_line_fingerprints",
+                ["xyz"],
+            ),
+            id="hunk-new-line-hmac",
+        ),
+        pytest.param(
+            lambda value: _replace_first_hunk_field(
+                value,
+                "old_line_fingerprints",
+                [_line_hmac("unexpected old line")],
+            ),
+            id="hunk-old-range-line-count",
         ),
         pytest.param(lambda value: {**value, "raw_prompt": "secret source = 41"}, id="unknown-raw-field"),
     ],
@@ -508,7 +584,14 @@ def test_prompt_evidence_rejects_invalid_hmac_only_schema_and_deletes_file(
 ) -> None:
     evidence_path = tmp_path / "prompt-evidence.json"
     evidence_path.write_text(
-        json.dumps(mutate(_valid_evidence(["user_value = 7"]))),
+        json.dumps(
+            mutate(
+                _valid_evidence(
+                    ["user_value = 7"],
+                    ["generated_value = 8"],
+                )
+            )
+        ),
         encoding="utf-8",
     )
 
@@ -518,6 +601,113 @@ def test_prompt_evidence_rejects_invalid_hmac_only_schema_and_deletes_file(
     assert not evidence_path.exists()
     persisted = json.dumps(_records(recorder), sort_keys=True)
     assert "secret source = 41" not in persisted
+
+
+@pytest.mark.parametrize(
+    "hunk",
+    [
+        pytest.param(
+            _proposed_hunk(
+                action="ADDED",
+                path="added.py",
+                old_start=0,
+                old_end=0,
+                new_start=0,
+                new_end=1,
+                new_lines=["added_value = 1"],
+            ),
+            id="added",
+        ),
+        pytest.param(
+            _proposed_hunk(
+                action="REPLACED",
+                path="replaced.py",
+                old_start=2,
+                old_end=3,
+                new_start=2,
+                new_end=3,
+                old_lines=["old_value = 1"],
+                new_lines=["new_value = 2"],
+            ),
+            id="replaced",
+        ),
+        pytest.param(
+            _proposed_hunk(
+                action="DELETED",
+                path="deleted.py",
+                old_start=4,
+                old_end=5,
+                new_start=4,
+                new_end=4,
+                old_lines=["deleted_value = 3"],
+            ),
+            id="deleted",
+        ),
+        pytest.param(
+            _proposed_hunk(
+                action="MOVED",
+                path="destination.py",
+                old_path="source.py",
+                old_start=6,
+                old_end=7,
+                new_start=1,
+                new_end=2,
+                old_lines=["moved_value = 4"],
+                new_lines=["moved_value = 4"],
+            ),
+            id="moved",
+        ),
+        pytest.param(
+            _proposed_hunk(
+                action="FORMATTED",
+                path="formatted.py",
+                old_start=8,
+                old_end=9,
+                new_start=8,
+                new_end=9,
+                old_lines=["formatted=5"],
+                new_lines=["formatted = 5"],
+            ),
+            id="formatted",
+        ),
+    ],
+)
+def test_strict_proposed_hunk_schema_supports_every_action_without_raw_source(
+    recorder: Recorder,
+    tmp_path: Path,
+    hunk: dict[str, object],
+) -> None:
+    evidence_path = tmp_path / "hunk-evidence.json"
+    evidence = _valid_evidence(proposed_hunks=[hunk])
+    encoded = json.dumps(evidence, sort_keys=True)
+    evidence_path.write_text(encoded, encoding="utf-8")
+
+    begun = recorder.begin("session-schema", evidence_path)
+
+    assert begun["ok"] is True
+    assert not evidence_path.exists()
+    with sqlite3.connect(recorder.store.database_path) as connection:
+        stored = connection.execute(
+            "SELECT prompt_evidence_json FROM active_transactions"
+        ).fetchone()
+    assert stored is not None
+    assert json.loads(stored[0]) == evidence
+    raw_markers = (
+        "added.py",
+        "replaced.py",
+        "deleted.py",
+        "source.py",
+        "destination.py",
+        "formatted.py",
+        "added_value = 1",
+        "old_value = 1",
+        "new_value = 2",
+        "deleted_value = 3",
+        "moved_value = 4",
+        "formatted=5",
+        "formatted = 5",
+    )
+    assert all(marker not in stored[0] for marker in raw_markers)
 
 
 def test_valid_prompt_hmac_evidence_classifies_matching_code_as_user_supplied(
@@ -584,6 +774,7 @@ def test_applied_repository_copy_can_still_be_classified_as_ai_reused(
             recorder,
             "session-1",
             applied_lines=copied_lines,
+            applied_path="copy.py",
         )["transaction_id"]
     )
     (repository / "copy.py").write_text(
@@ -632,6 +823,259 @@ def test_mixed_applied_patch_and_external_line_split_ai_from_unknown(
     persisted = recorder.store.ledger_path.read_text(encoding="utf-8")
     assert ai_line not in persisted
     assert external_line not in persisted
+
+
+def test_one_evidenced_addition_authorizes_only_its_bound_path_and_occurrence(
+    recorder: Recorder,
+    repository: Path,
+) -> None:
+    repeated_line = "same_generated_value = 7"
+    hunk = _proposed_hunk(
+        action="ADDED",
+        path="expected.py",
+        old_start=0,
+        old_end=0,
+        new_start=0,
+        new_end=1,
+        new_lines=[repeated_line],
+    )
+    transaction_id = str(
+        _begin_with_evidence(
+            recorder,
+            "session-bound",
+            proposed_hunks=[hunk],
+        )["transaction_id"]
+    )
+    (repository / "expected.py").write_text(
+        f"{repeated_line}\n{repeated_line}\n",
+        encoding="utf-8",
+    )
+    (repository / "external.py").write_text(repeated_line + "\n", encoding="utf-8")
+
+    ended = recorder.end(transaction_id, "passed")
+
+    assert ended["counts"] == {"AI_SKILL": 1, "UNKNOWN": 2}
+    patch_payloads = [record["payload"] for record in _event_records(recorder, "patch_applied")]
+    expected = next(payload for payload in patch_payloads if payload["path"] == "expected.py")
+    external = next(payload for payload in patch_payloads if payload["path"] == "external.py")
+    assert [span["classification"] for span in expected["spans"]] == [
+        "AI_SKILL",
+        "UNKNOWN",
+    ]
+    assert external["counts"] == {"UNKNOWN": 1}
+    serialized = recorder.store.ledger_path.read_text(encoding="utf-8")
+    assert repeated_line not in serialized
+
+
+def test_one_proposed_hunk_is_consumed_globally_at_most_once(
+    recorder: Recorder,
+) -> None:
+    line = "one_authorized_occurrence = 1"
+    span = PatchSpan.added("same.py", (line,))
+    metadata = _valid_evidence(
+        proposed_hunks=[
+            _proposed_hunk(
+                action="ADDED",
+                path="same.py",
+                old_start=0,
+                old_end=0,
+                new_start=0,
+                new_end=1,
+                new_lines=[line],
+            )
+        ]
+    )
+
+    classified = recorder._classify(
+        (span, span),
+        GitSnapshot("", "", "", {}),
+        metadata,
+    )
+
+    assert [item.classification for item in classified] == [
+        Classification.AI_SKILL,
+        Classification.UNKNOWN,
+    ]
+
+
+@pytest.mark.parametrize(
+    "mutate_hunk",
+    [
+        pytest.param(
+            lambda hunk: {**hunk, "path_hmac": _path_hmac("wrong.py")},
+            id="wrong-path",
+        ),
+        pytest.param(
+            lambda hunk: {**hunk, "action": "FORMATTED"},
+            id="wrong-action",
+        ),
+        pytest.param(
+            lambda hunk: {**hunk, "old_start": 1, "old_end": 2},
+            id="wrong-old-range",
+        ),
+        pytest.param(
+            lambda hunk: {**hunk, "new_start": 1, "new_end": 2},
+            id="wrong-new-range",
+        ),
+        pytest.param(
+            lambda hunk: {
+                **hunk,
+                "old_line_fingerprints": [_line_hmac("wrong_old = 1")],
+            },
+            id="wrong-old-lines",
+        ),
+        pytest.param(
+            lambda hunk: {
+                **hunk,
+                "new_line_fingerprints": [_line_hmac("wrong_new = 2")],
+            },
+            id="wrong-new-lines",
+        ),
+    ],
+)
+def test_replacement_requires_exact_hunk_binding_or_becomes_unknown(
+    recorder: Recorder,
+    repository: Path,
+    mutate_hunk,
+) -> None:
+    old_line = "before_value = 1"
+    new_line = "after_value = 2"
+    (repository / "tracked.py").write_text(old_line + "\n", encoding="utf-8")
+    subprocess.run(["git", "-C", repository, "add", "tracked.py"], check=True)
+    subprocess.run(
+        ["git", "-C", repository, "commit", "-q", "-m", "replacement base"],
+        check=True,
+    )
+    exact = _proposed_hunk(
+        action="REPLACED",
+        path="tracked.py",
+        old_start=0,
+        old_end=1,
+        new_start=0,
+        new_end=1,
+        old_lines=[old_line],
+        new_lines=[new_line],
+    )
+    transaction_id = str(
+        _begin_with_evidence(
+            recorder,
+            "session-mismatch",
+            proposed_hunks=[mutate_hunk(exact)],
+        )["transaction_id"]
+    )
+    (repository / "tracked.py").write_text(new_line + "\n", encoding="utf-8")
+
+    ended = recorder.end(transaction_id, "passed")
+
+    assert ended["counts"] == {"UNKNOWN": 1}
+
+
+def test_exact_evidenced_deletion_records_ai_action_without_new_stock(
+    recorder: Recorder,
+    repository: Path,
+) -> None:
+    deleted_line = "delete_me = 1"
+    (repository / "tracked.py").write_text(deleted_line + "\n", encoding="utf-8")
+    subprocess.run(["git", "-C", repository, "add", "tracked.py"], check=True)
+    subprocess.run(
+        ["git", "-C", repository, "commit", "-q", "-m", "deletion base"],
+        check=True,
+    )
+    transaction_id = str(
+        _begin_with_evidence(
+            recorder,
+            "session-delete",
+            proposed_hunks=[
+                _proposed_hunk(
+                    action="DELETED",
+                    path="tracked.py",
+                    old_start=0,
+                    old_end=1,
+                    new_start=0,
+                    new_end=0,
+                    old_lines=[deleted_line],
+                )
+            ],
+        )["transaction_id"]
+    )
+    (repository / "tracked.py").unlink()
+
+    ended = recorder.end(transaction_id, "passed")
+
+    assert ended["counts"] == {}
+    payload = _event_records(recorder, "patch_applied")[0]["payload"]
+    assert payload["spans"] == [
+        {
+            "action": "DELETED",
+            "classification": "LEGACY_UNKNOWN",
+            "confidence": 1.0,
+            "edit_actor": "AI",
+            "old_start": 0,
+            "old_end": 1,
+            "new_start": 0,
+            "new_end": 0,
+        }
+    ]
+    assert deleted_line not in recorder.store.ledger_path.read_text(encoding="utf-8")
+
+
+def test_exact_evidenced_move_records_ai_action_without_inflating_stock(
+    recorder: Recorder,
+    repository: Path,
+) -> None:
+    moved_lines = ["first_moved = 1", "second_moved = 2"]
+    source = repository / "source.py"
+    destination = repository / "destination.py"
+    source.write_text("\n".join(moved_lines) + "\n", encoding="utf-8")
+    subprocess.run(["git", "-C", repository, "add", "source.py"], check=True)
+    subprocess.run(
+        ["git", "-C", repository, "commit", "-q", "-m", "move base"],
+        check=True,
+    )
+    transaction_id = str(
+        _begin_with_evidence(
+            recorder,
+            "session-move",
+            proposed_hunks=[
+                _proposed_hunk(
+                    action="MOVED",
+                    path="destination.py",
+                    old_path="source.py",
+                    old_start=0,
+                    old_end=2,
+                    new_start=0,
+                    new_end=2,
+                    old_lines=moved_lines,
+                    new_lines=moved_lines,
+                )
+            ],
+        )["transaction_id"]
+    )
+    source.replace(destination)
+
+    ended = recorder.end(transaction_id, "passed")
+
+    assert ended["counts"] == {}
+    spans = [
+        span
+        for record in _event_records(recorder, "patch_applied")
+        for span in record["payload"]["spans"]
+    ]
+    assert spans == [
+        {
+            "action": "MOVED",
+            "classification": "LEGACY_UNKNOWN",
+            "confidence": 1.0,
+            "edit_actor": "AI",
+            "old_start": 0,
+            "old_end": 2,
+            "new_start": 0,
+            "new_end": 2,
+            "old_path_hmac": _path_hmac("source.py"),
+        }
+    ]
+    persisted = recorder.store.ledger_path.read_text(encoding="utf-8")
+    assert all(line not in persisted for line in moved_lines)
 
 
 def _invoke_main(capsys: pytest.CaptureFixture[str], *arguments: str) -> tuple[int, dict[str, object]]:
@@ -874,6 +1318,7 @@ def test_terminal_capture_or_diff_failure_closes_unknown_coverage_gap(
             recorder,
             "session-2",
             applied_lines=[later_line],
+            applied_new_start=1,
         )["transaction_id"]
     )
     (repository / "tracked.py").write_text(
@@ -882,6 +1327,59 @@ def test_terminal_capture_or_diff_failure_closes_unknown_coverage_gap(
     )
     later = recorder.end(next_transaction, "passed")
     assert later["counts"] == {"AI_SKILL": 1}
+
+
+def test_degradation_plan_store_failure_cannot_absorb_later_edits(
+    recorder: Recorder,
+    repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transaction_id = str(recorder.begin("session-plan-failure")["transaction_id"])
+    first_line = "failed_capture_interval = 1"
+    later_line = "must_not_be_absorbed = 2"
+    (repository / "tracked.py").write_text(first_line + "\n", encoding="utf-8")
+    real_capture = recorder_module.capture_snapshot
+
+    def fail_capture(*_args, **_kwargs):
+        raise RuntimeError("injected capture failure before degradation plan")
+
+    monkeypatch.setattr(recorder_module, "capture_snapshot", fail_capture)
+    with sqlite3.connect(recorder.store.database_path) as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER reject_degradation_plan
+            BEFORE UPDATE OF terminal_plan_json ON active_transactions
+            WHEN OLD.terminal_state = 'claimed'
+                 AND NEW.terminal_plan_json IS NOT NULL
+            BEGIN
+                SELECT RAISE(FAIL, 'injected degradation plan store failure');
+            END
+            """
+        )
+
+    degraded = recorder.end(transaction_id, "failed")
+
+    _drop_trigger(recorder, "reject_degradation_plan")
+    monkeypatch.setattr(recorder_module, "capture_snapshot", real_capture)
+    (repository / "tracked.py").write_text(
+        f"{first_line}\n{later_line}\n",
+        encoding="utf-8",
+    )
+
+    recovered = recorder.end(transaction_id, "failed")
+
+    assert recovered == degraded
+    assert degraded["ok"] is False
+    assert degraded["status"] == "unavailable"
+    assert degraded["error"] == "CAPTURE_FAILED"
+    assert degraded["coverage"] == "UNKNOWN"
+    assert degraded["counts"] == {}
+    recoveries = _event_records(recorder, "recovery_detected")
+    assert len(recoveries) == 1
+    assert recoveries[0]["event_id"] in degraded["event_ids"]
+    assert _event_records(recorder, "patch_applied") == []
+    fresh = recorder.begin("session-after-plan-failure")
+    assert fresh["ok"] is True
 
 
 def test_classifier_failure_downgrades_only_the_affected_span(
@@ -895,7 +1393,26 @@ def test_classifier_failure_downgrades_only_the_affected_span(
         _begin_with_evidence(
             recorder,
             "session-1",
-            applied_lines=["good = 1", "bad = 1"],
+            proposed_hunks=[
+                _proposed_hunk(
+                    action="ADDED",
+                    path="good.py",
+                    old_start=0,
+                    old_end=0,
+                    new_start=0,
+                    new_end=1,
+                    new_lines=["good = 1"],
+                ),
+                _proposed_hunk(
+                    action="ADDED",
+                    path="bad.py",
+                    old_start=0,
+                    old_end=0,
+                    new_start=0,
+                    new_end=1,
+                    new_lines=["bad = 1"],
+                ),
+            ],
         )["transaction_id"]
     )
     (repository / "good.py").write_text("good = 1\n", encoding="utf-8")

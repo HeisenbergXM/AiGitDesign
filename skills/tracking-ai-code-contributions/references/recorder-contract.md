@@ -24,7 +24,7 @@ The recorder is designed to raise the cost of common attribution fraud and expos
 The generation skill must perform these operations automatically:
 
 1. Run `aigit status --json` once per task and retain the health result.
-2. Generate the proposed patch in memory without editing the repository. Automatically write HMAC-only prompt-code evidence and separate HMAC-only fingerprints/counts for the exact proposed patch lines to the temporary evidence file. This is generation-skill bookkeeping: require no developer action and no Git, CI/CD, hosting, gateway, or model-platform cooperation.
+2. Generate the proposed patch in memory without editing the repository. Automatically write HMAC-only prompt-code evidence plus one strict proposed-hunk entry binding action, HMACed path/old-path, 0-based half-open old/new coordinates, and HMACed old/new lines. This requires no developer action and no Git, CI/CD, hosting, gateway, or model-platform cooperation.
 3. Before the first code edit, run `aigit begin` with the existing `--prompt-evidence` flag and retain `transaction_id`.
 4. Apply only the evidenced patch produced for the current invocation. Existing dirty changes stay outside the transaction. Use one transaction and a fresh evidence file per actual apply operation, including a follow-up fix.
 5. After each successful apply, run `aigit end` with the transaction ID and validation status.
@@ -48,7 +48,7 @@ aigit upload --repo <path> --once --json
 aigit report --repo <path> --rev <git-revision> --json
 ```
 
-`--prompt-evidence` keeps its existing name and contains two strict HMAC-only evidence groups: the original prompt-supplied code evidence and applied-patch evidence generated automatically from the exact patch the skill proposes to apply. It must not contain surrounding natural-language prompt text or raw code. Temporary evidence files are deleted automatically after `begin` succeeds, fails, or is rejected during argument parsing.
+`--prompt-evidence` keeps its existing name and contains prompt-supplied code evidence plus strict proposed-hunk evidence generated automatically from the exact patch. It contains no raw path, prompt text, or code. Every real separate or equals-form evidence path is deleted after `begin` succeeds, fails, or is rejected during parsing; a separate option followed by another option has no path and must not unlink an option-named file.
 
 The JSON object contains exactly these fields. Each fingerprint is a lowercase 64-hex HMAC-SHA256 value; each counts array must match its nested line-fingerprint blocks and normalized total. Empty evidence uses empty arrays and zero totals.
 
@@ -59,13 +59,23 @@ The JSON object contains exactly these fields. Each fingerprint is a lowercase 6
   "line_fingerprints": [],
   "normalized_line_count": 0,
   "normalized_token_count": 0,
-  "applied_patch_fingerprints": [],
-  "applied_patch_counts": [],
-  "applied_patch_line_fingerprints": [],
-  "applied_patch_normalized_line_count": 0,
-  "applied_patch_normalized_token_count": 0
+  "proposed_patch_hunks": [
+    {
+      "action": "ADDED",
+      "path_hmac": "64-lowercase-hex",
+      "old_path_hmac": null,
+      "old_start": 1,
+      "old_end": 1,
+      "new_start": 1,
+      "new_end": 2,
+      "old_line_fingerprints": [],
+      "new_line_fingerprints": ["64-lowercase-hex"]
+    }
+  ]
 }
 ```
+
+Path fingerprints are `HMAC-SHA256(key, "path\\0" + normalized-posix-path)` and line fingerprints are `HMAC-SHA256(key, "line\\0" + normalized-line)`. Hunk objects and top-level objects reject unknown fields. Coordinates are non-negative 0-based half-open ranges whose lengths exactly equal their fingerprint-list lengths. `ADDED` has no old lines, `DELETED` has no new lines, `MOVED` requires `old_path_hmac`, and `REPLACED`/`FORMATTED` require both sides.
 
 Every command returns JSON with `ok`, `status`, and an error code when degraded. `begin` additionally returns `transaction_id`; `end` returns `event_ids` and local queue status. Missing remote acknowledgement is not a command failure.
 
@@ -102,7 +112,7 @@ Minimum event types are `session_started`, `transaction_started`, `patch_applied
 
 ## Classification precedence
 
-First gate transaction attribution by applied-patch evidence. Matching lines continue through the ordered classifier below. A pure added span with both matching and unmatched lines is split losslessly; unmatched pieces are `UNKNOWN`. A partial match inside an inseparable replacement is conservatively `UNKNOWN` for the whole span. Missing applied-patch evidence never defaults to AI merely because the edit occurred inside a transaction.
+First gate transaction attribution by proposed-hunk evidence. Consume evidence hunks and observed spans globally and deterministically one-to-one. A pure added span may split losslessly only at bound coordinates/fingerprints. `REPLACED`, `FORMATTED`, `MOVED`, and `DELETED` require one complete unique action/path/range/old/new match; otherwise the whole span is `UNKNOWN`. Missing evidence never defaults to AI merely because the edit occurred inside a transaction.
 
 Apply rules in this order to each applied-evidence-matched span:
 
@@ -135,13 +145,13 @@ manual-candidate stock ratio = M / N
 coverage = (A + M + S) / N
 ```
 
-For action metrics, report added, replaced, moved, formatted, and deleted spans separately. A replacement is an action against old content plus surviving new content; do not sum both as current stock. A move creates no new physical instance. A copy does.
+For action metrics, report added, replaced, moved, formatted, and deleted spans separately. A replacement is an action against old content plus surviving new content; do not sum both as current stock. Exact moves, formatting, and deletions record `edit_actor=AI` but add no new stock. A copy does create a new instance.
 
 ## Failure and recovery
 
 - Recorder unavailable: fail open, make no attribution claim, report `provenance: unavailable`.
 - Begin append/queue half-failure: retain the deterministic start plan; a same-session retry repairs and returns the same transaction/event, while another session receives `ACTIVE_TRANSACTION`.
-- End capture or diff failure: durably complete the transaction with one deterministic `recovery_detected` coverage-gap event classified `UNKNOWN`. A retry returns the same degraded result, and later edits cannot be absorbed into the failed transaction.
+- End claim atomically persists a deterministic generic `UNKNOWN` recovery fallback before capture/diff. A successful attempt replaces it with the exact event plan. Capture/diff failure, or failure while storing a more specific degradation plan, executes the persisted fallback; retries return that same result and later edits cannot be absorbed.
 - Server unavailable: append locally, report `provenance: local-only`, retry after 5, 15, 60, and 300 seconds, then every 300 seconds with jitter, using idempotent event IDs.
 - Heartbeat or sequence gap: emit `recovery_detected`; affected content is `UNKNOWN` unless stronger pre-existing evidence resolves it.
 - Duplicate upload: server returns the existing acknowledgement without duplicating the event.

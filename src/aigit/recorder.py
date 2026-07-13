@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import asdict, dataclass, replace
+import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -49,8 +51,27 @@ class _TerminalPlan:
     result: dict[str, object]
 
 
+@dataclass(frozen=True)
+class _ProposedHunk:
+    action: ActionKind
+    path_hmac: str
+    old_path_hmac: str | None
+    old_start: int
+    old_end: int
+    new_start: int
+    new_end: int
+    old_line_fingerprints: tuple[str, ...]
+    new_line_fingerprints: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _TerminalClaim:
+    active: _ActiveTransaction
+    fresh: bool
+
+
 SQLITE_TIMEOUT_SECONDS = 0.2
-SQLITE_INITIALIZATION_TIMEOUT_SECONDS = 0.01
+SQLITE_INITIALIZATION_TIMEOUT_SECONDS = 0.001
 _EVENT_NAMESPACE = UUID("7a207a4d-e4df-49a6-a976-75ef255f33aa")
 _PROMPT_EVIDENCE_KEYS = frozenset(
     {
@@ -59,11 +80,20 @@ _PROMPT_EVIDENCE_KEYS = frozenset(
         "normalized_line_count",
         "normalized_token_count",
         "line_fingerprints",
-        "applied_patch_fingerprints",
-        "applied_patch_counts",
-        "applied_patch_normalized_line_count",
-        "applied_patch_normalized_token_count",
-        "applied_patch_line_fingerprints",
+        "proposed_patch_hunks",
+    }
+)
+_PROPOSED_HUNK_KEYS = frozenset(
+    {
+        "action",
+        "path_hmac",
+        "old_path_hmac",
+        "old_start",
+        "old_end",
+        "new_start",
+        "new_end",
+        "old_line_fingerprints",
+        "new_line_fingerprints",
     }
 )
 
@@ -80,15 +110,28 @@ class Recorder:
         self.repo_id = repo_id(self.repository)
         configured_root = state_root or os.environ.get("AIGIT_STATE_DIR")
         root = Path(configured_root) if configured_root else Path.home() / ".aigit"
+        state_path = root / self.repo_id.removeprefix("sha256:")
+        self._probe_existing_database(state_path / "state.sqlite3")
         self._sqlite_timeout = SQLITE_INITIALIZATION_TIMEOUT_SECONDS
         self.store = LocalStore(
-            root / self.repo_id.removeprefix("sha256:"),
+            state_path,
             connection_timeout=SQLITE_INITIALIZATION_TIMEOUT_SECONDS,
         )
         self._migrate_active_transactions()
         self._sqlite_timeout = SQLITE_TIMEOUT_SECONDS
         self.store.connection_timeout = SQLITE_TIMEOUT_SECONDS
         self._prompt_hmac_key = self._load_or_create_prompt_hmac_key()
+
+    @staticmethod
+    def _probe_existing_database(database_path: Path) -> None:
+        if not database_path.is_file():
+            return
+        connection = sqlite3.connect(database_path, timeout=0)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.rollback()
+        finally:
+            connection.close()
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(
@@ -276,19 +319,23 @@ class Recorder:
         if validation not in {"passed", "failed", "not-run"}:
             raise InvalidRecorderInput("validation must be passed, failed, or not-run")
         operation = f"end:{validation}"
-        claimed = self._claim_terminal(transaction_id, operation)
+        self._repair_started_event(transaction_id)
+        claimed = self._claim_terminal(
+            transaction_id,
+            operation,
+            persist_fallback=True,
+        )
         if isinstance(claimed, dict):
             return claimed
-        active = claimed
-        self._repair_started_event(transaction_id)
-        existing_plan = self._load_terminal_plan(transaction_id, operation)
-        if isinstance(existing_plan, dict):
-            return existing_plan
-        if existing_plan is not None:
+        active = claimed.active
+        if not claimed.fresh:
+            existing_plan = self._load_terminal_plan(transaction_id, operation)
+            if isinstance(existing_plan, dict):
+                return existing_plan
+            if existing_plan is None:
+                raise RecorderStateError("claimed end has no terminal plan")
             return self._execute_terminal_plan(
-                transaction_id,
-                operation,
-                existing_plan,
+                transaction_id, operation, existing_plan
             )
         try:
             after = capture_snapshot(self.repository, self.store)
@@ -360,10 +407,11 @@ class Recorder:
             "queue_status": "pending",
             "counts": dict(sorted(total_counts.items())),
         }
-        prepared = self._store_or_load_terminal_plan(
+        prepared = self._replace_terminal_fallback(
             active.transaction_id,
             operation,
             _TerminalPlan(tuple(events), result),
+            "exact",
         )
         if isinstance(prepared, dict):
             return prepared
@@ -380,7 +428,7 @@ class Recorder:
         claimed = self._claim_terminal(transaction_id, operation)
         if isinstance(claimed, dict):
             return claimed
-        active = claimed
+        active = claimed.active
         self._repair_started_event(transaction_id)
         existing_plan = self._load_terminal_plan(transaction_id, operation)
         if isinstance(existing_plan, dict):
@@ -426,6 +474,34 @@ class Recorder:
         operation: str,
         reason_code: str,
     ) -> dict[str, object]:
+        if reason_code == "CAPTURE_FAILED":
+            prepared = self._load_terminal_plan(active.transaction_id, operation)
+        else:
+            proposed = self._degradation_plan(active, reason_code)
+            try:
+                prepared = self._replace_terminal_fallback(
+                    active.transaction_id,
+                    operation,
+                    proposed,
+                    "degraded",
+                )
+            except sqlite3.DatabaseError:
+                prepared = self._load_terminal_plan(active.transaction_id, operation)
+        if isinstance(prepared, dict):
+            return prepared
+        if prepared is None:
+            raise RecorderStateError("claimed end has no fallback plan")
+        return self._execute_terminal_plan(
+            active.transaction_id,
+            operation,
+            prepared,
+        )
+
+    def _degradation_plan(
+        self,
+        active: _ActiveTransaction,
+        reason_code: str,
+    ) -> _TerminalPlan:
         recovery = self._planned_event(
             active,
             "recovery_detected",
@@ -445,18 +521,7 @@ class Recorder:
             "queue_status": "pending",
             "counts": {},
         }
-        prepared = self._store_or_load_terminal_plan(
-            active.transaction_id,
-            operation,
-            _TerminalPlan((recovery,), result),
-        )
-        if isinstance(prepared, dict):
-            return prepared
-        return self._execute_terminal_plan(
-            active.transaction_id,
-            operation,
-            prepared,
-        )
+        return _TerminalPlan((recovery,), result)
 
     def status(self) -> dict[str, object]:
         try:
@@ -597,6 +662,11 @@ class Recorder:
                     "ALTER TABLE active_transactions "
                     "ADD COLUMN terminal_plan_json TEXT"
                 )
+            if "terminal_plan_kind" not in columns:
+                connection.execute(
+                    "ALTER TABLE active_transactions "
+                    "ADD COLUMN terminal_plan_kind TEXT"
+                )
             if "started_event_json" not in columns:
                 connection.execute(
                     "ALTER TABLE active_transactions "
@@ -644,15 +714,7 @@ class Recorder:
         line_fingerprints = parsed["line_fingerprints"]
         normalized_line_count = parsed["normalized_line_count"]
         normalized_token_count = parsed["normalized_token_count"]
-        applied_fingerprints = parsed["applied_patch_fingerprints"]
-        applied_counts = parsed["applied_patch_counts"]
-        applied_line_fingerprints = parsed["applied_patch_line_fingerprints"]
-        applied_normalized_line_count = parsed[
-            "applied_patch_normalized_line_count"
-        ]
-        applied_normalized_token_count = parsed[
-            "applied_patch_normalized_token_count"
-        ]
+        proposed_hunks = parsed["proposed_patch_hunks"]
         if not isinstance(fingerprints, list) or not all(
             Recorder._is_sha256_hmac(item) for item in fingerprints
         ):
@@ -693,74 +755,100 @@ class Recorder:
             raise InvalidRecorderInput(
                 "normalized token count must be a non-negative integer"
             )
-        if not isinstance(applied_fingerprints, list) or not all(
-            Recorder._is_sha256_hmac(item) for item in applied_fingerprints
-        ):
-            raise InvalidRecorderInput(
-                "applied patch fingerprints must be SHA-256 HMAC strings"
-            )
-        if not isinstance(applied_counts, list) or not all(
-            isinstance(item, int) and not isinstance(item, bool) and item > 0
-            for item in applied_counts
-        ):
-            raise InvalidRecorderInput(
-                "applied patch counts must be positive integer values"
-            )
-        if not isinstance(applied_line_fingerprints, list) or not all(
-            isinstance(block, list)
-            and all(Recorder._is_sha256_hmac(item) for item in block)
-            for block in applied_line_fingerprints
-        ):
-            raise InvalidRecorderInput(
-                "applied patch line fingerprints must be nested SHA-256 HMAC strings"
-            )
-        if not (
-            len(applied_fingerprints)
-            == len(applied_counts)
-            == len(applied_line_fingerprints)
-            and all(
-                count == len(block)
-                for count, block in zip(
-                    applied_counts,
-                    applied_line_fingerprints,
-                    strict=True,
-                )
-            )
-        ):
-            raise InvalidRecorderInput(
-                "applied patch evidence block counts do not match"
-            )
-        if (
-            not isinstance(applied_normalized_line_count, int)
-            or isinstance(applied_normalized_line_count, bool)
-            or applied_normalized_line_count < 0
-            or applied_normalized_line_count != sum(applied_counts)
-        ):
-            raise InvalidRecorderInput(
-                "applied patch normalized line count does not match"
-            )
-        if (
-            not isinstance(applied_normalized_token_count, int)
-            or isinstance(applied_normalized_token_count, bool)
-            or applied_normalized_token_count < 0
-        ):
-            raise InvalidRecorderInput(
-                "applied patch normalized token count must be a non-negative integer"
-            )
+        if not isinstance(proposed_hunks, list):
+            raise InvalidRecorderInput("proposed_patch_hunks must be a list")
+        normalized_hunks = [
+            Recorder._validate_proposed_hunk(item) for item in proposed_hunks
+        ]
         return {
-            "applied_patch_counts": applied_counts,
-            "applied_patch_fingerprints": applied_fingerprints,
-            "applied_patch_line_fingerprints": applied_line_fingerprints,
-            "applied_patch_normalized_line_count": applied_normalized_line_count,
-            "applied_patch_normalized_token_count": (
-                applied_normalized_token_count
-            ),
             "counts": counts,
             "fingerprints": fingerprints,
             "line_fingerprints": line_fingerprints,
             "normalized_line_count": normalized_line_count,
             "normalized_token_count": normalized_token_count,
+            "proposed_patch_hunks": normalized_hunks,
         }
+
+    @staticmethod
+    def _validate_proposed_hunk(value: object) -> dict[str, object]:
+        if not isinstance(value, dict) or set(value) != _PROPOSED_HUNK_KEYS:
+            raise InvalidRecorderInput(
+                "each proposed patch hunk must contain only the strict hunk schema"
+            )
+        action_value = value["action"]
+        try:
+            action = ActionKind(action_value)
+        except (TypeError, ValueError) as exc:
+            raise InvalidRecorderInput("proposed hunk action is invalid") from exc
+
+        path_hmac = value["path_hmac"]
+        old_path_hmac = value["old_path_hmac"]
+        if not Recorder._is_sha256_hmac(path_hmac):
+            raise InvalidRecorderInput("proposed hunk path_hmac is invalid")
+        if old_path_hmac is not None and not Recorder._is_sha256_hmac(old_path_hmac):
+            raise InvalidRecorderInput("proposed hunk old_path_hmac is invalid")
+
+        coordinates: dict[str, int] = {}
+        for name in ("old_start", "old_end", "new_start", "new_end"):
+            coordinate = value[name]
+            if (
+                not isinstance(coordinate, int)
+                or isinstance(coordinate, bool)
+                or coordinate < 0
+            ):
+                raise InvalidRecorderInput("proposed hunk coordinates are invalid")
+            coordinates[name] = coordinate
+        if (
+            coordinates["old_end"] < coordinates["old_start"]
+            or coordinates["new_end"] < coordinates["new_start"]
+        ):
+            raise InvalidRecorderInput("proposed hunk ranges are invalid")
+
+        old_fingerprints = Recorder._validate_hunk_fingerprints(
+            value["old_line_fingerprints"],
+            "old",
+        )
+        new_fingerprints = Recorder._validate_hunk_fingerprints(
+            value["new_line_fingerprints"],
+            "new",
+        )
+        old_count = coordinates["old_end"] - coordinates["old_start"]
+        new_count = coordinates["new_end"] - coordinates["new_start"]
+        if old_count != len(old_fingerprints) or new_count != len(new_fingerprints):
+            raise InvalidRecorderInput(
+                "proposed hunk ranges must match line fingerprint counts"
+            )
+
+        if action is ActionKind.ADDED:
+            valid_shape = old_count == 0 and new_count > 0 and old_path_hmac is None
+        elif action is ActionKind.DELETED:
+            valid_shape = old_count > 0 and new_count == 0 and old_path_hmac is None
+        elif action is ActionKind.MOVED:
+            valid_shape = old_count > 0 and new_count > 0 and old_path_hmac is not None
+        else:
+            valid_shape = old_count > 0 and new_count > 0 and old_path_hmac is None
+        if not valid_shape:
+            raise InvalidRecorderInput(
+                "proposed hunk action is inconsistent with its paths and ranges"
+            )
+        return {
+            "action": action.value,
+            "path_hmac": path_hmac,
+            "old_path_hmac": old_path_hmac,
+            **coordinates,
+            "old_line_fingerprints": old_fingerprints,
+            "new_line_fingerprints": new_fingerprints,
+        }
+
+    @staticmethod
+    def _validate_hunk_fingerprints(value: object, side: str) -> list[str]:
+        if not isinstance(value, list) or not all(
+            Recorder._is_sha256_hmac(item) for item in value
+        ):
+            raise InvalidRecorderInput(
+                f"proposed hunk {side} line fingerprints are invalid"
+            )
+        return list(value)
 
     @staticmethod
     def _is_sha256_hmac(value: object) -> bool:
@@ -774,7 +862,9 @@ class Recorder:
         self,
         transaction_id: str,
         operation: str,
-    ) -> _ActiveTransaction | dict[str, object]:
+        *,
+        persist_fallback: bool = False,
+    ) -> _TerminalClaim | dict[str, object]:
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -782,7 +872,7 @@ class Recorder:
                 """
                 SELECT transaction_id, repo_id, session_id, started_at,
                        snapshot_json, prompt_evidence_json,
-                       terminal_state, terminal_operation
+                       terminal_state, terminal_operation, terminal_plan_kind
                 FROM active_transactions
                 WHERE transaction_id = ? AND repo_id = ?
                 """,
@@ -803,18 +893,49 @@ class Recorder:
 
             state = str(row[6] or "active")
             claimed_operation = row[7]
+            active = self._active_from_row(row)
+            fresh = False
             if state == "active":
-                connection.execute(
-                    """
-                    UPDATE active_transactions
-                    SET terminal_state = 'claimed', terminal_operation = ?
-                    WHERE transaction_id = ? AND repo_id = ?
-                    """,
-                    (operation, transaction_id, self.repo_id),
-                )
+                fresh = True
+                if persist_fallback:
+                    fallback = self._degradation_plan(active, "CAPTURE_FAILED")
+                    connection.execute(
+                        """
+                        UPDATE active_transactions
+                        SET terminal_state = 'claimed',
+                            terminal_operation = ?,
+                            terminal_plan_json = ?,
+                            terminal_plan_kind = 'fallback'
+                        WHERE transaction_id = ? AND repo_id = ?
+                        """,
+                        (
+                            operation,
+                            self._encode_terminal_plan(fallback),
+                            transaction_id,
+                            self.repo_id,
+                        ),
+                    )
+                else:
+                    connection.execute(
+                        """
+                        UPDATE active_transactions
+                        SET terminal_state = 'claimed', terminal_operation = ?
+                        WHERE transaction_id = ? AND repo_id = ?
+                        """,
+                        (operation, transaction_id, self.repo_id),
+                    )
             elif state != "claimed":
                 raise RecorderStateError("active transaction terminal state is corrupt")
             elif claimed_operation != operation:
+                connection.commit()
+                return {
+                    "ok": False,
+                    "status": "unavailable",
+                    "error": "TERMINAL_OPERATION_IN_PROGRESS",
+                    "event_ids": [],
+                    "counts": {},
+                }
+            elif persist_fallback and row[8] == "fallback":
                 connection.commit()
                 return {
                     "ok": False,
@@ -829,7 +950,7 @@ class Recorder:
             raise
         finally:
             connection.close()
-        return self._active_from_row(row)
+        return _TerminalClaim(active, fresh)
 
     def _active_from_row(self, row: tuple[object, ...]) -> _ActiveTransaction:
         if not isinstance(row[4], str):
@@ -880,12 +1001,7 @@ class Recorder:
         operation: str,
         proposed: _TerminalPlan,
     ) -> _TerminalPlan | dict[str, object]:
-        encoded = canonical_json(
-            {
-                "events": [asdict(event) for event in proposed.events],
-                "result": proposed.result,
-            }
-        ).decode("utf-8")
+        encoded = self._encode_terminal_plan(proposed)
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -920,7 +1036,7 @@ class Recorder:
                 connection.execute(
                     """
                     UPDATE active_transactions
-                    SET terminal_plan_json = ?
+                    SET terminal_plan_json = ?, terminal_plan_kind = 'exact'
                     WHERE transaction_id = ? AND repo_id = ?
                     """,
                     (encoded, transaction_id, self.repo_id),
@@ -937,6 +1053,80 @@ class Recorder:
             raise
         finally:
             connection.close()
+
+    def _replace_terminal_fallback(
+        self,
+        transaction_id: str,
+        operation: str,
+        proposed: _TerminalPlan,
+        plan_kind: str,
+    ) -> _TerminalPlan | dict[str, object]:
+        encoded = self._encode_terminal_plan(proposed)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT terminal_operation, terminal_plan_json, terminal_plan_kind
+                FROM active_transactions
+                WHERE transaction_id = ? AND repo_id = ?
+                """,
+                (transaction_id, self.repo_id),
+            ).fetchone()
+            if row is None:
+                completed = self._completed_result(
+                    connection,
+                    transaction_id,
+                    operation,
+                )
+                connection.commit()
+                if completed is not None:
+                    return completed
+                raise RecorderStateError("claimed transaction disappeared")
+            if row[0] != operation:
+                connection.commit()
+                return {
+                    "ok": False,
+                    "status": "unavailable",
+                    "error": "TERMINAL_OPERATION_IN_PROGRESS",
+                    "event_ids": [],
+                    "counts": {},
+                }
+            if row[2] == "fallback":
+                connection.execute(
+                    """
+                    UPDATE active_transactions
+                    SET terminal_plan_json = ?, terminal_plan_kind = ?
+                    WHERE transaction_id = ? AND repo_id = ?
+                    """,
+                    (
+                        encoded,
+                        plan_kind,
+                        transaction_id,
+                        self.repo_id,
+                    ),
+                )
+                selected = proposed
+            elif isinstance(row[1], str):
+                selected = self._decode_terminal_plan(row[1])
+            else:
+                raise RecorderStateError("terminal plan state is corrupt")
+            connection.commit()
+            return selected
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _encode_terminal_plan(plan: _TerminalPlan) -> str:
+        return canonical_json(
+            {
+                "events": [asdict(event) for event in plan.events],
+                "result": plan.result,
+            }
+        ).decode("utf-8")
 
     def _load_terminal_plan(
         self,
@@ -1134,7 +1324,8 @@ class Recorder:
         before: GitSnapshot,
         prompt_metadata: dict[str, object],
     ) -> list[PatchSpan]:
-        spans_list = list(spans)
+        proposed_hunks = self._proposed_hunks(prompt_metadata)
+        spans_list = self._coalesce_evidenced_moves(list(spans), proposed_hunks)
         repository_blocks: list[RepositoryBlock] = []
         for path, reference in before.files.items():
             if not reference.startswith("sha256:"):
@@ -1164,39 +1355,215 @@ class Recorder:
             repository_blocks=tuple(repository_blocks),
             removed_blocks=removed_blocks,
         )
-        applied_evidence = self._applied_patch_evidence(prompt_metadata)
+        consumed_hunks: set[int] = set()
         classified: list[PatchSpan] = []
         for span in spans_list:
-            ranges = applied_evidence.matching_ranges(span.new_lines)
-            if ranges == ((0, len(span.new_lines)),):
-                classified.extend(self._classify_one_span(span, context))
+            if span.action is ActionKind.ADDED:
+                classified.extend(
+                    self._classify_added_span(
+                        span,
+                        context,
+                        proposed_hunks,
+                        consumed_hunks,
+                    )
+                )
                 continue
-            if not ranges or span.action is not ActionKind.ADDED:
+            candidates = [
+                index
+                for index, hunk in enumerate(proposed_hunks)
+                if index not in consumed_hunks
+                and self._hunk_matches_span(hunk, span)
+            ]
+            if len(candidates) != 1:
                 classified.append(self._unknown_classification(span))
                 continue
-
-            position = 0
-            for start, end in ranges:
-                if position < start:
-                    classified.append(
-                        self._unknown_classification(
-                            self._added_subspan(span, position, start)
-                        )
-                    )
-                classified.extend(
-                    self._classify_one_span(
-                        self._added_subspan(span, start, end),
-                        context,
-                    )
-                )
-                position = end
-            if position < len(span.new_lines):
+            selected_hunk = proposed_hunks[candidates[0]]
+            consumed_hunks.add(candidates[0])
+            if span.action is ActionKind.DELETED:
                 classified.append(
-                    self._unknown_classification(
-                        self._added_subspan(span, position, len(span.new_lines))
+                    replace(
+                        span,
+                        classification=Classification.LEGACY_UNKNOWN,
+                        confidence=1.0,
                     )
                 )
+            else:
+                authorized = self._classify_one_span(span, context)
+                if selected_hunk.action is ActionKind.FORMATTED and any(
+                    item.action is not ActionKind.FORMATTED for item in authorized
+                ):
+                    classified.append(self._unknown_classification(span))
+                else:
+                    classified.extend(authorized)
         return classified
+
+    def _classify_added_span(
+        self,
+        span: PatchSpan,
+        context: ClassificationContext,
+        hunks: tuple[_ProposedHunk, ...],
+        consumed: set[int],
+    ) -> list[PatchSpan]:
+        candidates: dict[tuple[int, int], list[int]] = defaultdict(list)
+        for index, hunk in enumerate(hunks):
+            if index in consumed:
+                continue
+            matched_range = self._added_hunk_range(span, hunk)
+            if matched_range is not None:
+                candidates[matched_range].append(index)
+
+        selected: list[tuple[int, int, int]] = []
+        previous_end = -1
+        for (start, end), indexes in sorted(candidates.items()):
+            if len(indexes) != 1 or start < previous_end:
+                continue
+            selected.append((start, end, indexes[0]))
+            previous_end = end
+        if not selected:
+            return [self._unknown_classification(span)]
+
+        result: list[PatchSpan] = []
+        position = 0
+        for start, end, hunk_index in selected:
+            if position < start:
+                result.append(
+                    self._unknown_classification(
+                        self._added_subspan(span, position, start)
+                    )
+                )
+            consumed.add(hunk_index)
+            result.extend(
+                self._classify_one_span(
+                    self._added_subspan(span, start, end),
+                    context,
+                )
+            )
+            position = end
+        if position < len(span.new_lines):
+            result.append(
+                self._unknown_classification(
+                    self._added_subspan(span, position, len(span.new_lines))
+                )
+            )
+        return result
+
+    def _added_hunk_range(
+        self,
+        span: PatchSpan,
+        hunk: _ProposedHunk,
+    ) -> tuple[int, int] | None:
+        if (
+            hunk.action is not ActionKind.ADDED
+            or not self._path_matches(span.path, hunk.path_hmac)
+            or hunk.old_start != span.old_start
+            or hunk.old_end != span.old_end
+            or hunk.new_start < span.new_start
+            or hunk.new_end > span.new_end
+        ):
+            return None
+        start = hunk.new_start - span.new_start
+        end = hunk.new_end - span.new_start
+        if not self._lines_match(
+            span.new_lines[start:end],
+            hunk.new_line_fingerprints,
+        ):
+            return None
+        return start, end
+
+    def _hunk_matches_span(self, hunk: _ProposedHunk, span: PatchSpan) -> bool:
+        action_matches = hunk.action is span.action or (
+            hunk.action is ActionKind.FORMATTED
+            and span.action is ActionKind.REPLACED
+        )
+        if (
+            not action_matches
+            or not self._path_matches(span.path, hunk.path_hmac)
+            or hunk.old_start != span.old_start
+            or hunk.old_end != span.old_end
+            or hunk.new_start != span.new_start
+            or hunk.new_end != span.new_end
+        ):
+            return False
+        if hunk.old_path_hmac is None:
+            if span.old_path is not None:
+                return False
+        elif span.old_path is None or not self._path_matches(
+            span.old_path,
+            hunk.old_path_hmac,
+        ):
+            return False
+        return self._lines_match(
+            span.old_lines,
+            hunk.old_line_fingerprints,
+        ) and self._lines_match(
+            span.new_lines,
+            hunk.new_line_fingerprints,
+        )
+
+    def _coalesce_evidenced_moves(
+        self,
+        spans: list[PatchSpan],
+        hunks: tuple[_ProposedHunk, ...],
+    ) -> list[PatchSpan]:
+        replacements: dict[int, PatchSpan] = {}
+        consumed_span_indexes: set[int] = set()
+        for hunk in hunks:
+            if hunk.action is not ActionKind.MOVED:
+                continue
+            deleted = [
+                index
+                for index, span in enumerate(spans)
+                if index not in consumed_span_indexes
+                and span.action is ActionKind.DELETED
+                and hunk.old_path_hmac is not None
+                and self._path_matches(span.path, hunk.old_path_hmac)
+                and span.old_start == hunk.old_start
+                and span.old_end == hunk.old_end
+                and self._lines_match(
+                    span.old_lines,
+                    hunk.old_line_fingerprints,
+                )
+            ]
+            added = [
+                index
+                for index, span in enumerate(spans)
+                if index not in consumed_span_indexes
+                and span.action is ActionKind.ADDED
+                and self._path_matches(span.path, hunk.path_hmac)
+                and span.new_start == hunk.new_start
+                and span.new_end == hunk.new_end
+                and self._lines_match(
+                    span.new_lines,
+                    hunk.new_line_fingerprints,
+                )
+            ]
+            if len(deleted) != 1 or len(added) != 1:
+                continue
+            deleted_index, added_index = deleted[0], added[0]
+            source, destination = spans[deleted_index], spans[added_index]
+            combined = PatchSpan(
+                path=destination.path,
+                old_path=source.path,
+                old_start=source.old_start,
+                old_end=source.old_end,
+                new_start=destination.new_start,
+                new_end=destination.new_end,
+                old_lines=source.old_lines,
+                new_lines=destination.new_lines,
+                classification=Classification.UNKNOWN,
+                action=ActionKind.MOVED,
+                confidence=0.0,
+            )
+            anchor = min(deleted_index, added_index)
+            replacements[anchor] = combined
+            consumed_span_indexes.update((deleted_index, added_index))
+        return [
+            replacements[index]
+            if index in replacements
+            else span
+            for index, span in enumerate(spans)
+            if index not in consumed_span_indexes or index in replacements
+        ]
 
     @staticmethod
     def _classify_one_span(
@@ -1255,43 +1622,77 @@ class Recorder:
             line_fingerprints,
         )
 
-    def _applied_patch_evidence(
+    def _proposed_hunks(
         self,
         metadata: dict[str, object],
-    ) -> PromptEvidence:
+    ) -> tuple[_ProposedHunk, ...]:
         if not metadata:
-            return PromptEvidence((), (), self._prompt_hmac_key, ())
+            return ()
         try:
-            fingerprints = tuple(metadata["applied_patch_fingerprints"])
-            counts = tuple(metadata["applied_patch_counts"])
-            line_fingerprints = tuple(
-                tuple(block)
-                for block in metadata["applied_patch_line_fingerprints"]
+            raw_hunks = metadata["proposed_patch_hunks"]
+            if not isinstance(raw_hunks, list):
+                raise TypeError
+            normalized = [self._validate_proposed_hunk(item) for item in raw_hunks]
+            return tuple(
+                _ProposedHunk(
+                    action=ActionKind(item["action"]),
+                    path_hmac=str(item["path_hmac"]),
+                    old_path_hmac=(
+                        str(item["old_path_hmac"])
+                        if item["old_path_hmac"] is not None
+                        else None
+                    ),
+                    old_start=int(item["old_start"]),
+                    old_end=int(item["old_end"]),
+                    new_start=int(item["new_start"]),
+                    new_end=int(item["new_end"]),
+                    old_line_fingerprints=tuple(item["old_line_fingerprints"]),
+                    new_line_fingerprints=tuple(item["new_line_fingerprints"]),
+                )
+                for item in normalized
             )
-        except (KeyError, TypeError) as exc:
-            raise RecorderStateError(
-                "applied patch evidence metadata is corrupt"
-            ) from exc
-        if not all(isinstance(item, str) for item in fingerprints):
-            raise RecorderStateError("applied patch evidence metadata is corrupt")
-        if not all(isinstance(item, int) for item in counts):
-            raise RecorderStateError("applied patch evidence metadata is corrupt")
-        if not all(
-            all(isinstance(item, str) for item in block)
-            for block in line_fingerprints
-        ):
-            raise RecorderStateError("applied patch evidence metadata is corrupt")
-        return PromptEvidence(
-            fingerprints,
-            counts,
+        except (InvalidRecorderInput, KeyError, TypeError, ValueError) as exc:
+            raise RecorderStateError("proposed patch hunk metadata is corrupt") from exc
+
+    def _path_matches(self, path: str, expected_hmac: str) -> bool:
+        normalized = path.replace("\\", "/")
+        actual = hmac.new(
             self._prompt_hmac_key,
-            line_fingerprints,
+            b"path\0" + normalized.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        return hmac.compare_digest(actual, expected_hmac)
+
+    def _lines_match(
+        self,
+        lines: Iterable[str],
+        expected_hmacs: tuple[str, ...],
+    ) -> bool:
+        materialized = tuple(lines)
+        if len(materialized) != len(expected_hmacs):
+            return False
+        return all(
+            hmac.compare_digest(
+                hmac.new(
+                    self._prompt_hmac_key,
+                    b"line\0" + line.encode("utf-8"),
+                    hashlib.sha256,
+                ).hexdigest(),
+                expected,
+            )
+            for line, expected in zip(materialized, expected_hmacs, strict=True)
         )
 
     @staticmethod
     def _span_counts(spans: Iterable[PatchSpan]) -> dict[str, int]:
         counts: dict[str, int] = defaultdict(int)
         for span in spans:
+            if span.action in {
+                ActionKind.DELETED,
+                ActionKind.MOVED,
+                ActionKind.FORMATTED,
+            }:
+                continue
             count = sum(1 for line in span.new_lines if line.rstrip())
             if count:
                 counts[span.classification.value] += count
@@ -1306,8 +1707,9 @@ class Recorder:
         counts: dict[str, int],
         validation: str,
     ) -> dict[str, object]:
-        span_evidence = [
-            {
+        span_evidence: list[dict[str, object]] = []
+        for span in spans:
+            evidence: dict[str, object] = {
                 "action": span.action.value,
                 "classification": span.classification.value,
                 "confidence": span.confidence,
@@ -1316,8 +1718,19 @@ class Recorder:
                 "new_start": span.new_start,
                 "new_end": span.new_end,
             }
-            for span in spans
-        ]
+            if span.action in {
+                ActionKind.DELETED,
+                ActionKind.MOVED,
+                ActionKind.FORMATTED,
+            } and span.confidence == 1.0:
+                evidence["edit_actor"] = "AI"
+            if span.action is ActionKind.MOVED and span.old_path is not None:
+                evidence["old_path_hmac"] = hmac.new(
+                    self._prompt_hmac_key,
+                    b"path\0" + span.old_path.replace("\\", "/").encode("utf-8"),
+                    hashlib.sha256,
+                ).hexdigest()
+            span_evidence.append(evidence)
         classification = (
             next(iter(counts)) if len(counts) == 1 else Classification.UNKNOWN.value
         )

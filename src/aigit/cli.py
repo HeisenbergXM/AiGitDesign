@@ -95,23 +95,25 @@ def _emit(payload: dict[str, object]) -> None:
     )
 
 
-def _begin_evidence_path(arguments: Sequence[str]) -> Path | None:
+def _begin_evidence_paths(arguments: Sequence[str]) -> tuple[Path, ...]:
     if not arguments or arguments[0] != "begin":
-        return None
+        return ()
+    paths: list[Path] = []
     for index, argument in enumerate(arguments):
         if argument == "--prompt-evidence":
-            if index + 1 < len(arguments):
-                return Path(arguments[index + 1])
-            return None
+            if index + 1 < len(arguments) and not arguments[index + 1].startswith("-"):
+                paths.append(Path(arguments[index + 1]))
+            continue
         if argument.startswith("--prompt-evidence="):
             value = argument.partition("=")[2]
-            return Path(value) if value else None
-    return None
+            if value:
+                paths.append(Path(value))
+    return tuple(dict.fromkeys(paths))
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     raw_arguments = list(sys.argv[1:] if argv is None else argv)
-    evidence_path = _begin_evidence_path(raw_arguments)
+    evidence_paths = _begin_evidence_paths(raw_arguments)
     try:
         arguments = _parser().parse_args(raw_arguments)
         payload = _dispatch(arguments)
@@ -164,7 +166,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         exit_code = 3 if payload.get("error") == "STATE_CORRUPTION" else 0
     finally:
-        if evidence_path is not None:
+        for evidence_path in evidence_paths:
             try:
                 evidence_path.unlink(missing_ok=True)
             except OSError:

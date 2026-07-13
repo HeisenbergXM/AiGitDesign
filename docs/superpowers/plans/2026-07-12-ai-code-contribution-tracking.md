@@ -10,8 +10,8 @@
 
 ## Global Constraints
 
-- The generation skill automatically creates HMAC-only fingerprints for both complete prompt-supplied code and the exact proposed patch before `begin`, passes them through the existing `--prompt-evidence` file, and applies exactly that evidenced patch. This requires no developer action and no Git, CI/CD, hosting, gateway, or model-platform cooperation.
-- A transaction boundary alone is not AI attribution evidence. Only diff lines matching automatic applied-patch evidence continue through prompt/reuse/AI classification; unmatched or missing applied evidence is `UNKNOWN`. Pure added mixed spans split losslessly, while inseparable partial replacements remain wholly `UNKNOWN`.
+- The generation skill automatically creates HMAC-only fingerprints for complete prompt-supplied code and a strict list of exact proposed hunks before `begin`, passes them through the existing `--prompt-evidence` file, and applies exactly that evidenced patch. Each hunk binds action, HMACed path/old-path, 0-based half-open old/new coordinates, and HMACed old/new lines. This requires no developer action and no Git, CI/CD, hosting, gateway, or model-platform cooperation.
+- A transaction boundary alone is not AI attribution evidence. Proposed hunks and observed spans are globally consumed one-to-one; only a fully bound match continues through prompt/reuse/AI classification. Unmatched, reused, ambiguous, or missing evidence is `UNKNOWN`. Pure added spans may split at exactly bound coordinates; replacements, formatting, moves, and deletions require one complete unique match. Moves/deletions record `edit_actor=AI` without inflating current stock.
 
 - 只实施 README 第 1 档和第 2 档；不建设模型网关，不截取 token，不要求模型部门、Git 平台或 CI/CD 配合。
 - 不要求开发者加标签、写特殊提交信息、填表、确认归因或手工补传。
@@ -353,7 +353,7 @@ git commit -m "feat: classify ai reuse moves and supplied code"
 - Consumes: snapshot, store and classifier APIs from Tasks 2-4.
 - Produces: `Recorder.begin`, `Recorder.end`, `Recorder.abort`, and the exact CLI in `skills/tracking-ai-code-contributions/references/recorder-contract.md`.
 
-**Approved evidence constraint:** Before `begin`, the generation skill produces the exact patch in memory and automatically writes strict HMAC-only prompt and applied-patch evidence to the existing temporary evidence file. The recorder gates transaction attribution with applied-patch evidence: matching lines retain prompt-first/reuse/AI precedence, unmatched or missing evidence is `UNKNOWN`, pure added mixed spans split, and inseparable partial replacements are wholly `UNKNOWN`. The skill requires no developer labels, Git/CI changes, or model-platform support.
+**Approved evidence constraint:** Before `begin`, the generation skill produces the exact patch in memory and automatically writes strict HMAC-only prompt evidence plus proposed-hunk evidence to the existing temporary evidence file. Every proposed hunk binds action, HMACed path/old-path, 0-based half-open old/new coordinates, and HMACed old/new lines. The recorder consumes proposed hunks and observed spans globally one-to-one: exact matches retain prompt-first/reuse/AI precedence; missing, mismatched, duplicated, or ambiguous evidence is `UNKNOWN`. Pure additions may split at bound coordinates, while replacements, formatting, moves, and deletions require a complete unique match. Exact moves/deletions record AI edit action without inflating stock. The skill requires no developer labels, Git/CI changes, or model-platform support.
 
 - [ ] **Step 1: Write a transaction boundary test**
 
@@ -373,9 +373,25 @@ def invoke(*args: object) -> dict[str, object]:
     return json.loads(result.stdout)
 
 
-def test_cli_records_only_net_applied_patch(repo) -> None:
+def test_cli_without_proposed_hunk_evidence_is_unknown(repo) -> None:
     (repo / "dirty.py").write_text("manual = 1\n", encoding="utf-8")
     begun = invoke("begin", "--repo", repo, "--session", "s-1")
+    (repo / "dirty.py").write_text("manual = 1\nai = 2\n", encoding="utf-8")
+    ended = invoke("end", "--repo", repo, "--transaction", begun["transaction_id"], "--validation", "passed")
+    assert ended["counts"] == {"UNKNOWN": 1}
+
+
+def test_cli_records_only_exactly_bound_proposed_hunk(repo, bound_hunk_evidence) -> None:
+    (repo / "dirty.py").write_text("manual = 1\n", encoding="utf-8")
+    evidence = bound_hunk_evidence(
+        action="ADDED", path="dirty.py",
+        old_range=(1, 1), new_range=(1, 2),
+        old_lines=(), new_lines=("ai = 2",),
+    )
+    begun = invoke(
+        "begin", "--repo", repo, "--session", "s-2",
+        "--prompt-evidence", evidence,
+    )
     (repo / "dirty.py").write_text("manual = 1\nai = 2\n", encoding="utf-8")
     ended = invoke("end", "--repo", repo, "--transaction", begun["transaction_id"], "--validation", "passed")
     assert ended["status"] in {"recorded", "local-only"}
@@ -392,7 +408,9 @@ Expected: FAIL because `aigit.cli` is absent.
 
 `begin` acquires a per-repo lock for at most 250 ms, captures the before snapshot, creates a deterministic `transaction_started` plan/result, persists the active transaction, deletes the prompt evidence file in `finally`, and returns immediately. A same-session retry after append/queue half-failure repairs and returns that same transaction/event; a different session returns JSON error `ACTIVE_TRANSACTION` without touching Git.
 
-`end` repairs any pending start event, captures after snapshot, computes only snapshot delta, gates spans by automatic applied-patch evidence, appends one `patch_applied` event per file plus `transaction_finished`, enqueues them, deletes the active transaction and returns counts. If capture or diff fails, durably complete with deterministic `recovery_detected`/`UNKNOWN` coverage-gap evidence so retries or later edits cannot be absorbed. If classification cannot isolate a span, append `UNKNOWN` rather than absorbing all current diff.
+`end` repairs any pending start event, captures after snapshot, computes only snapshot delta, and globally consumes strict proposed-hunk evidence one-to-one. Each match binds action, HMACed path/old-path, 0-based half-open coordinates, and HMACed old/new lines. Pure additions may split only at bound coordinates; replacement, formatting, move, and deletion evidence must match one complete unique span. Exact moves/deletions record `edit_actor=AI` without adding stock. It appends one `patch_applied` event per affected file plus `transaction_finished`, enqueues them, deletes the active transaction and returns counts. Missing or mismatched evidence is `UNKNOWN`.
+
+Before risky end capture/diff work, persist enough deterministic fallback state that a capture failure, diff failure, or failure while writing the degradation plan still closes the claimed interval with the same `recovery_detected`/`UNKNOWN` result on retry. Later edits must never be absorbed into that failed transaction.
 
 `abort` appends `transaction_aborted` and clears the transaction without contribution. All commands print one JSON object and use exit code 0 for recorded/local-only/unavailable fail-open states; use non-zero only for invalid arguments or state corruption.
 
@@ -402,7 +420,7 @@ Implement `status`, `begin`, `end`, `abort`, `link-commit`, `upload`, and `repor
 
 Run: `python -m pytest tests/integration/test_recorder_cli.py -q`
 
-Expected: tests pass; pre-existing dirty content never appears in the AI counts; missing server returns `local-only` without delaying longer than 500 ms.
+Expected: tests pass; no-evidence edits are `UNKNOWN`; exactly bound proposed hunks alone are AI-eligible; duplicate/path/action/range/content mismatches remain `UNKNOWN`; pre-existing dirty content never appears in AI counts; missing server returns `local-only` without delaying longer than 500 ms.
 
 - [ ] **Step 5: Commit**
 
