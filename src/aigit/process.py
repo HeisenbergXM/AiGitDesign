@@ -8,6 +8,7 @@ import platform
 import subprocess as _subprocess
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 
 from aigit.git_state import find_repo, repo_id
@@ -23,6 +24,8 @@ subprocess = SimpleNamespace(
     DETACHED_PROCESS=getattr(_subprocess, "DETACHED_PROCESS", 0),
 )
 
+LOCK_STALE_SECONDS = 30
+
 
 def ensure_observer(root: str | Path) -> None:
     """Ensure one live detached observer child exists for *root*."""
@@ -35,17 +38,10 @@ def ensure_observer(root: str | Path) -> None:
     pid_path = state_path / "observer.pid"
     lock_path = state_path / "observer.pid.lock"
 
-    try:
-        lock_descriptor = os.open(
-            lock_path,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-            0o600,
-        )
-    except FileExistsError:
+    if not _acquire_launch_lock(lock_path):
         return
 
     try:
-        os.close(lock_descriptor)
         pid = _read_pid(pid_path)
         if pid is not None and _pid_is_live(pid):
             return
@@ -74,6 +70,41 @@ def ensure_observer(root: str | Path) -> None:
         _write_pid(pid_path, int(child.pid))
     finally:
         lock_path.unlink(missing_ok=True)
+
+
+def _acquire_launch_lock(path: Path) -> bool:
+    for _attempt in range(2):
+        try:
+            descriptor = os.open(
+                path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+        except FileExistsError:
+            owner = _read_pid(path)
+            if owner is not None:
+                if _pid_is_live(owner):
+                    return False
+            else:
+                try:
+                    age = time.time() - path.stat().st_mtime
+                except FileNotFoundError:
+                    continue
+                if age < LOCK_STALE_SECONDS:
+                    return False
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            continue
+
+        try:
+            os.write(descriptor, f"{os.getpid()}\n".encode("ascii"))
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        return True
+    return False
 
 
 def _read_pid(path: Path) -> int | None:

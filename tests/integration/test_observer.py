@@ -206,6 +206,116 @@ def test_active_transaction_is_deferred_entirely_to_recorder_end(
     assert after_transaction.payload["spans"][0]["new_start"] == 2
 
 
+@pytest.mark.parametrize(
+    ("age_seconds", "event_type", "classification"),
+    [
+        pytest.param(10, "workspace_edit", "MANUAL_CANDIDATE", id="healthy"),
+        pytest.param(31, "recovery_detected", "UNKNOWN", id="gap"),
+    ],
+)
+def test_reconciliation_preserves_external_edit_before_transaction_on_same_path(
+    observer: Observer,
+    clock: FakeClock,
+    repo: Path,
+    state_root: Path,
+    age_seconds: int,
+    event_type: str,
+    classification: str,
+) -> None:
+    observer.tick(clock.now())
+    clock.advance(seconds=age_seconds)
+    (repo / "app.py").write_text(
+        "committed = 0\nexternal_before = 1\n", encoding="utf-8"
+    )
+    recorder = Recorder(repo, state_root)
+    transaction_id = str(recorder.begin("agent-after-external")["transaction_id"])
+    (repo / "app.py").write_text(
+        "committed = 0\nexternal_before = 1\nai_change = 2\n",
+        encoding="utf-8",
+    )
+    assert recorder.end(transaction_id, "passed")["ok"] is True
+
+    event = _only_contribution(observer.tick(clock.now()))
+
+    assert event.event_type == event_type
+    assert event.payload["classification"] == classification
+    assert event.payload["normalized_lines"] == 1
+    assert event.payload["spans"][0]["new_start"] == 1
+    assert event.payload["spans"][0]["new_end"] == 2
+
+
+def test_capture_failure_keeps_delta_unknown_until_successful_recovery(
+    observer: Observer,
+    clock: FakeClock,
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observer.tick(clock.now())
+    (repo / "app.py").write_text(
+        "committed = 0\nunreadable_during_poll = 1\n", encoding="utf-8"
+    )
+    real_capture = observer_module.capture_snapshot
+
+    def fail_capture(*_args: object, **_kwargs: object) -> GitSnapshot:
+        raise OSError("injected unreadable snapshot")
+
+    monkeypatch.setattr(observer_module, "capture_snapshot", fail_capture)
+    clock.advance(seconds=10)
+    failed_tick = observer.tick(clock.now())
+
+    failed_recovery = _only_contribution(failed_tick)
+    assert failed_recovery.event_type == "recovery_detected"
+    assert failed_recovery.payload["classification"] == "UNKNOWN"
+    assert _events_of_type(failed_tick, "heartbeat")[0].payload["healthy"] is False
+
+    monkeypatch.setattr(observer_module, "capture_snapshot", real_capture)
+    clock.advance(seconds=10)
+    recovered = _only_contribution(observer.tick(clock.now()))
+
+    assert recovered.event_type == "recovery_detected"
+    assert recovered.payload["classification"] == "UNKNOWN"
+    assert recovered.payload["normalized_lines"] == 1
+
+
+def test_transaction_completed_during_capture_is_never_manual_candidate(
+    observer: Observer,
+    clock: FakeClock,
+    repo: Path,
+    state_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observer.tick(clock.now())
+    recorder = Recorder(repo, state_root)
+    real_capture = observer_module.capture_snapshot
+    raced = False
+
+    def capture_while_transaction_completes(
+        *args: object, **kwargs: object
+    ) -> GitSnapshot:
+        nonlocal raced
+        if not raced:
+            raced = True
+            transaction_id = str(
+                recorder.begin("agent-capture-race")["transaction_id"]
+            )
+            (repo / "app.py").write_text(
+                "committed = 0\nai_during_capture = 1\n", encoding="utf-8"
+            )
+            assert recorder.end(transaction_id, "passed")["ok"] is True
+        return real_capture(*args, **kwargs)
+
+    monkeypatch.setattr(
+        observer_module,
+        "capture_snapshot",
+        capture_while_transaction_completes,
+    )
+    clock.advance(seconds=10)
+
+    event = _only_contribution(observer.tick(clock.now()))
+
+    assert event.payload["classification"] == "UNKNOWN"
+
+
 def test_first_recovery_heartbeat_is_the_next_healthy_baseline(
     observer: Observer,
     clock: FakeClock,
@@ -599,3 +709,32 @@ def test_corrupt_pid_file_recovers_atomically_and_launch_failure_is_safe(
     if pid_path.exists():
         assert pid_path.read_text(encoding="ascii") == "invalid-again\n"
     assert list(pid_path.parent.glob("observer.pid.*.tmp")) == []
+
+
+def test_ensure_observer_recovers_lock_owned_by_dead_process(
+    repo: Path,
+    state_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pid_path = _observer_pid_path(repo, state_root)
+    pid_path.parent.mkdir(parents=True)
+    lock_path = pid_path.parent / "observer.pid.lock"
+    lock_path.write_text("31337\n", encoding="ascii")
+    launches: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def pid_is_dead(pid: int, _signal: int) -> None:
+        assert pid == 31337
+        raise ProcessLookupError
+
+    monkeypatch.setattr(process_module.os, "kill", pid_is_dead)
+    monkeypatch.setattr(
+        process_module.subprocess,
+        "Popen",
+        _FakePopen(launches, 8448),
+    )
+
+    ensure_observer(repo)
+
+    assert len(launches) == 1
+    assert pid_path.read_text(encoding="ascii") == "8448\n"
+    assert not lock_path.exists()

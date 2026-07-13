@@ -33,6 +33,22 @@ _EMPTY_PROMPT_EVIDENCE_KEY = b"aigit-observer-empty-evidence"
 class _ObserverState:
     snapshot: GitSnapshot
     last_heartbeat_at: datetime
+    last_healthy_at: datetime
+    ledger_sequence: int
+    coverage_uncertain: bool
+
+
+@dataclass(frozen=True)
+class _ReconciledDelta:
+    before: GitSnapshot
+    after: GitSnapshot
+    spans: tuple[PatchSpan, ...]
+
+
+@dataclass(frozen=True)
+class _Reconciliation:
+    snapshot: GitSnapshot
+    deltas: tuple[_ReconciledDelta, ...]
     ledger_sequence: int
 
 
@@ -78,12 +94,19 @@ class Observer:
             self._started = True
             emitted.append(self._heartbeat(snapshot, observed_at))
             self._save_state(
-                _ObserverState(snapshot, observed_at, self._current_sequence())
+                _ObserverState(
+                    snapshot,
+                    observed_at,
+                    observed_at,
+                    self._current_sequence(),
+                    False,
+                )
             )
             return emitted
 
         gap = (
-            observed_at - state.last_heartbeat_at
+            state.coverage_uncertain
+            or observed_at - state.last_healthy_at
             > timedelta(seconds=HEALTHY_WINDOW_SECONDS)
         )
         if not self._started:
@@ -112,37 +135,102 @@ class Observer:
             )
 
         if self._has_active_transaction():
-            emitted.append(self._heartbeat(state.snapshot, observed_at))
+            healthy = not state.coverage_uncertain
+            emitted.append(
+                self._heartbeat(state.snapshot, observed_at, healthy=healthy)
+            )
             self._save_state(
                 _ObserverState(
                     state.snapshot,
                     observed_at,
+                    observed_at if healthy else state.last_healthy_at,
                     state.ledger_sequence,
+                    state.coverage_uncertain,
                 )
             )
             return emitted
 
-        baseline = self._reconcile_completed_transactions(state)
+        reconciliation = self._reconcile_completed_transactions(state)
+        baseline = reconciliation.snapshot
+        contribution_emitted = False
+        for delta in reconciliation.deltas:
+            grouped_delta: dict[str, list[PatchSpan]] = defaultdict(list)
+            for span in delta.spans:
+                grouped_delta[span.path].append(span)
+            for path in sorted(grouped_delta):
+                ambiguous = _path_is_ambiguous(path, delta.before, delta.after)
+                classified = self._classify(
+                    grouped_delta[path],
+                    healthy=not gap and not ambiguous,
+                )
+                emitted.append(
+                    self._emit(
+                        "recovery_detected" if gap else "workspace_edit",
+                        self._delta_payload(
+                            delta.before,
+                            delta.after,
+                            path,
+                            classified,
+                        ),
+                        observed_at,
+                    )
+                )
+                contribution_emitted = True
+
+        capture_fence = self._current_sequence()
         try:
             current = capture_snapshot(self.repository, self.store)
             spans = diff_snapshots(baseline, current, self.store)
         except Exception:
-            current = baseline
-            spans = []
-            gap = True
+            emitted.append(
+                self._emit(
+                    "recovery_detected",
+                    {
+                        "classification": Classification.UNKNOWN.value,
+                        "normalized_lines": 0,
+                        "dirty_diff_hash_before": baseline.worktree_hash,
+                        "dirty_diff_hash_after": None,
+                        "spans": [],
+                        "reason_code": "CAPTURE_FAILED",
+                    },
+                    observed_at,
+                )
+            )
+            emitted.append(
+                self._heartbeat(baseline, observed_at, healthy=False)
+            )
+            self._save_state(
+                _ObserverState(
+                    baseline,
+                    observed_at,
+                    state.last_healthy_at,
+                    self._current_sequence(),
+                    True,
+                )
+            )
+            return emitted
 
         # A transaction that began during capture owns this boundary. Do not
         # consume it or advance the persisted snapshot past it.
         if self._has_active_transaction():
-            emitted.append(self._heartbeat(state.snapshot, observed_at))
+            healthy = not state.coverage_uncertain
+            emitted.append(
+                self._heartbeat(baseline, observed_at, healthy=healthy)
+            )
             self._save_state(
                 _ObserverState(
-                    state.snapshot,
+                    baseline,
                     observed_at,
-                    state.ledger_sequence,
+                    observed_at if healthy else state.last_healthy_at,
+                    capture_fence,
+                    state.coverage_uncertain,
                 )
             )
             return emitted
+
+        transaction_race = self._transaction_event_after(capture_fence)
+        if transaction_race:
+            gap = True
 
         grouped: dict[str, list[PatchSpan]] = defaultdict(list)
         for span in spans:
@@ -163,8 +251,9 @@ class Observer:
                     observed_at,
                 )
             )
+            contribution_emitted = True
 
-        if gap and not spans:
+        if gap and not contribution_emitted:
             emitted.append(
                 self._emit(
                     "recovery_detected",
@@ -174,7 +263,11 @@ class Observer:
                         "dirty_diff_hash_before": baseline.worktree_hash,
                         "dirty_diff_hash_after": current.worktree_hash,
                         "spans": [],
-                        "reason_code": "HEARTBEAT_GAP",
+                        "reason_code": (
+                            "TRANSACTION_RACE"
+                            if transaction_race
+                            else "HEARTBEAT_GAP"
+                        ),
                     },
                     observed_at,
                 )
@@ -182,7 +275,13 @@ class Observer:
 
         emitted.append(self._heartbeat(current, observed_at))
         self._save_state(
-            _ObserverState(current, observed_at, self._current_sequence())
+            _ObserverState(
+                current,
+                observed_at,
+                observed_at,
+                self._current_sequence(),
+                False,
+            )
         )
         return emitted
 
@@ -244,11 +343,17 @@ class Observer:
             "spans": span_evidence,
         }
 
-    def _heartbeat(self, snapshot: GitSnapshot, now: datetime) -> Event:
+    def _heartbeat(
+        self,
+        snapshot: GitSnapshot,
+        now: datetime,
+        *,
+        healthy: bool = True,
+    ) -> Event:
         return self._emit(
             "heartbeat",
             {
-                "healthy": True,
+                "healthy": healthy,
                 "interval_seconds": HEARTBEAT_INTERVAL_SECONDS,
                 "snapshot_hash": snapshot.worktree_hash,
             },
@@ -304,10 +409,30 @@ class Observer:
                     repo_id TEXT PRIMARY KEY,
                     snapshot_json TEXT NOT NULL,
                     last_heartbeat_at TEXT NOT NULL,
+                    last_healthy_at TEXT NOT NULL,
+                    coverage_uncertain INTEGER NOT NULL DEFAULT 0,
                     ledger_sequence INTEGER NOT NULL
                 )
                 """
             )
+            columns = {
+                str(row[1])
+                for row in connection.execute(
+                    "PRAGMA table_info(observer_state)"
+                ).fetchall()
+            }
+            if "last_healthy_at" not in columns:
+                connection.execute(
+                    "ALTER TABLE observer_state ADD COLUMN last_healthy_at TEXT"
+                )
+                connection.execute(
+                    "UPDATE observer_state SET last_healthy_at = last_heartbeat_at"
+                )
+            if "coverage_uncertain" not in columns:
+                connection.execute(
+                    "ALTER TABLE observer_state ADD COLUMN coverage_uncertain "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
             connection.commit()
         finally:
             connection.close()
@@ -317,7 +442,8 @@ class Observer:
         try:
             row = connection.execute(
                 """
-                SELECT snapshot_json, last_heartbeat_at, ledger_sequence
+                SELECT snapshot_json, last_heartbeat_at, last_healthy_at,
+                       ledger_sequence, coverage_uncertain
                 FROM observer_state WHERE repo_id = ?
                 """,
                 (self.repo_id,),
@@ -338,10 +464,12 @@ class Observer:
                 },
             )
             heartbeat = _parse_timestamp(str(row[1]))
-            sequence = int(row[2])
+            healthy = _parse_timestamp(str(row[2]))
+            sequence = int(row[3])
+            uncertain = bool(int(row[4]))
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise RuntimeError("observer state is corrupt") from exc
-        return _ObserverState(snapshot, heartbeat, sequence)
+        return _ObserverState(snapshot, heartbeat, healthy, sequence, uncertain)
 
     def _save_state(self, state: _ObserverState) -> None:
         snapshot_json = canonical_json(asdict(state.snapshot)).decode("utf-8")
@@ -351,18 +479,23 @@ class Observer:
             connection.execute(
                 """
                 INSERT INTO observer_state (
-                    repo_id, snapshot_json, last_heartbeat_at, ledger_sequence
-                ) VALUES (?, ?, ?, ?)
+                    repo_id, snapshot_json, last_heartbeat_at, last_healthy_at,
+                    ledger_sequence, coverage_uncertain
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(repo_id) DO UPDATE SET
                     snapshot_json = excluded.snapshot_json,
                     last_heartbeat_at = excluded.last_heartbeat_at,
-                    ledger_sequence = excluded.ledger_sequence
+                    last_healthy_at = excluded.last_healthy_at,
+                    ledger_sequence = excluded.ledger_sequence,
+                    coverage_uncertain = excluded.coverage_uncertain
                 """,
                 (
                     self.repo_id,
                     snapshot_json,
                     _timestamp(state.last_heartbeat_at),
+                    _timestamp(state.last_healthy_at),
                     state.ledger_sequence,
+                    int(state.coverage_uncertain),
                 ),
             )
             connection.commit()
@@ -397,7 +530,7 @@ class Observer:
     def _reconcile_completed_transactions(
         self,
         state: _ObserverState,
-    ) -> GitSnapshot:
+    ) -> _Reconciliation:
         records = [
             record
             for record in self._ledger_records()
@@ -410,38 +543,119 @@ class Observer:
             and isinstance(record.get("payload"), dict)
         }
         if not completed:
-            return state.snapshot
+            return _Reconciliation(
+                state.snapshot,
+                (),
+                max(
+                    (int(record.get("sequence", 0)) for record in records),
+                    default=state.ledger_sequence,
+                ),
+            )
 
-        files = dict(state.snapshot.files)
-        head = state.snapshot.head
-        worktree_hash = state.snapshot.worktree_hash
-        for record in records:
-            payload = record.get("payload")
-            if not isinstance(payload, dict):
-                continue
-            transaction_id = str(payload.get("transaction_id"))
-            if transaction_id not in completed:
-                continue
-            if record.get("event_type") == "patch_applied":
+        baseline = state.snapshot
+        deltas: list[_ReconciledDelta] = []
+        finished_records = sorted(
+            (
+                record
+                for record in records
+                if record.get("event_type") == "transaction_finished"
+                and isinstance(record.get("payload"), dict)
+            ),
+            key=lambda record: int(record.get("sequence", 0)),
+        )
+        for finished in finished_records:
+            finished_payload = finished["payload"]
+            transaction_id = str(finished_payload.get("transaction_id"))
+            patches = [
+                record
+                for record in records
+                if record.get("event_type") == "patch_applied"
+                and isinstance(record.get("payload"), dict)
+                and str(record["payload"].get("transaction_id"))
+                == transaction_id
+            ]
+            before_files = dict(baseline.files)
+            head_before = baseline.head
+            dirty_before = baseline.worktree_hash
+            for patch in patches:
+                payload = patch["payload"]
+                path = payload.get("path")
+                before_blob = payload.get("before_blob")
+                if isinstance(path, str):
+                    if isinstance(before_blob, str):
+                        before_files[path] = before_blob
+                    elif before_blob is None:
+                        before_files.pop(path, None)
+                candidate_head = payload.get("head_before")
+                if isinstance(candidate_head, str):
+                    head_before = candidate_head
+                candidate_hash = payload.get("dirty_diff_hash_before")
+                if isinstance(candidate_hash, str):
+                    dirty_before = candidate_hash
+            transaction_before = GitSnapshot(
+                head=head_before,
+                index_hash=baseline.index_hash,
+                worktree_hash=dirty_before,
+                files=before_files,
+            )
+            external_spans = tuple(
+                diff_snapshots(baseline, transaction_before, self.store)
+            )
+            if external_spans:
+                deltas.append(
+                    _ReconciledDelta(
+                        baseline,
+                        transaction_before,
+                        external_spans,
+                    )
+                )
+
+            after_files = dict(transaction_before.files)
+            dirty_after = transaction_before.worktree_hash
+            for patch in patches:
+                payload = patch["payload"]
                 path = payload.get("path")
                 after_blob = payload.get("after_blob")
                 if isinstance(path, str):
                     if isinstance(after_blob, str):
-                        files[path] = after_blob
+                        after_files[path] = after_blob
                     elif after_blob is None:
-                        files.pop(path, None)
-                dirty_hash = payload.get("dirty_diff_hash_after")
-                if isinstance(dirty_hash, str):
-                    worktree_hash = dirty_hash
-            elif record.get("event_type") == "transaction_finished":
-                head_after = payload.get("head_after")
-                if isinstance(head_after, str):
-                    head = head_after
-        return GitSnapshot(
-            head=head,
-            index_hash=state.snapshot.index_hash,
-            worktree_hash=worktree_hash,
-            files=files,
+                        after_files.pop(path, None)
+                candidate_hash = payload.get("dirty_diff_hash_after")
+                if isinstance(candidate_hash, str):
+                    dirty_after = candidate_hash
+            head_after = finished_payload.get("head_after")
+            baseline = GitSnapshot(
+                head=(
+                    str(head_after)
+                    if isinstance(head_after, str)
+                    else transaction_before.head
+                ),
+                index_hash=transaction_before.index_hash,
+                worktree_hash=dirty_after,
+                files=after_files,
+            )
+
+        return _Reconciliation(
+            baseline,
+            tuple(deltas),
+            max(
+                (int(record.get("sequence", 0)) for record in records),
+                default=state.ledger_sequence,
+            ),
+        )
+
+    def _transaction_event_after(self, sequence: int) -> bool:
+        transaction_events = {
+            "transaction_started",
+            "patch_applied",
+            "transaction_finished",
+            "transaction_aborted",
+        }
+        return any(
+            int(record.get("sequence", 0)) > sequence
+            and record.get("event_type") in transaction_events
+            for record in self._ledger_records()
         )
 
     def _ledger_records(self) -> list[dict[str, Any]]:
