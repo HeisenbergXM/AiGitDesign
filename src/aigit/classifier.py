@@ -1,0 +1,160 @@
+"""Ordered provenance classification for isolated repository patch spans."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+from difflib import SequenceMatcher
+import re
+from typing import Iterable, Sequence
+
+from aigit.domain import ActionKind, Classification, PatchSpan
+from aigit.prompt_evidence import PromptEvidence, _metric_lines, _normalize_lines
+
+
+_TOKEN_PATTERN = re.compile(
+    r'''"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[A-Za-z_$][\w$]*|\d+(?:\.\d+)?|==|!=|<=|>=|=>|::|&&|\|\||\S'''
+)
+
+
+@dataclass(frozen=True, slots=True)
+class RepositoryBlock:
+    path: str
+    lines: tuple[str, ...]
+    origin: Classification
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "lines", _normalize_lines(self.lines))
+
+
+@dataclass(frozen=True, slots=True)
+class ClassificationContext:
+    in_transaction: bool
+    observer_healthy: bool
+    prompt_evidence: PromptEvidence
+    repository_blocks: tuple[RepositoryBlock, ...]
+    removed_blocks: tuple[RepositoryBlock, ...]
+
+
+def _tokens(lines: Iterable[str]) -> tuple[str, ...]:
+    text = "\n".join(_normalize_lines(lines))
+    return tuple(_TOKEN_PATTERN.findall(text))
+
+
+def _aligned_similarity(
+    left_tokens: Sequence[str],
+    right_tokens: Sequence[str],
+) -> float:
+    if not left_tokens or not right_tokens:
+        return 0.0
+
+    matcher = SequenceMatcher(None, left_tokens, right_tokens, autojunk=False)
+    largest = matcher.find_longest_match()
+    shorter_length = min(len(left_tokens), len(right_tokens))
+
+    if len(left_tokens) <= len(right_tokens):
+        start = max(0, min(largest.b - largest.a, len(right_tokens) - shorter_length))
+        left = left_tokens
+        right = right_tokens[start : start + shorter_length]
+    else:
+        start = max(0, min(largest.a - largest.b, len(left_tokens) - shorter_length))
+        left = left_tokens[start : start + shorter_length]
+        right = right_tokens
+
+    return SequenceMatcher(None, left, right, autojunk=False).ratio()
+
+
+def _same_normalized_block(left: Iterable[str], right: Iterable[str]) -> bool:
+    return _metric_lines(left) == _metric_lines(right)
+
+
+def _format_only_match(left: Iterable[str], right: Iterable[str]) -> bool:
+    left_lines = _metric_lines(left)
+    right_lines = _metric_lines(right)
+    return bool(left_lines and right_lines and _tokens(left_lines) == _tokens(right_lines))
+
+
+def _removed_source(
+    span: PatchSpan,
+    context: ClassificationContext,
+) -> tuple[RepositoryBlock, ActionKind] | None:
+    destination = _metric_lines(span.new_lines)
+    if not destination:
+        return None
+
+    for source in context.removed_blocks:
+        if span.old_path is not None and source.path != span.old_path:
+            continue
+        if _same_normalized_block(source.lines, destination):
+            action = ActionKind.MOVED if source.path != span.path else ActionKind.FORMATTED
+            return source, action
+        if source.path == span.path and _format_only_match(source.lines, destination):
+            return source, ActionKind.FORMATTED
+    return None
+
+
+def _reuse_confidence(
+    destination: Iterable[str],
+    repository_blocks: Iterable[RepositoryBlock],
+) -> float | None:
+    destination_lines = _metric_lines(destination)
+    if len(destination_lines) >= 3:
+        for source in repository_blocks:
+            if destination_lines == _metric_lines(source.lines):
+                return 1.0
+
+    if len(destination_lines) < 5:
+        return None
+
+    destination_tokens = _tokens(destination_lines)
+    best = 0.0
+    for source in repository_blocks:
+        source_lines = _metric_lines(source.lines)
+        if len(source_lines) < 5:
+            continue
+        similarity = _aligned_similarity(destination_tokens, _tokens(source_lines))
+        best = max(best, similarity)
+
+    return best if best >= 0.85 else None
+
+
+def _classify_span(span: PatchSpan, context: ClassificationContext) -> PatchSpan:
+    destination = _metric_lines(span.new_lines)
+
+    if destination and context.prompt_evidence.overlaps(destination):
+        return replace(span, classification=Classification.USER_SUPPLIED, confidence=1.0)
+
+    removed = _removed_source(span, context)
+    if removed is not None:
+        source, action = removed
+        return replace(span, classification=source.origin, action=action, confidence=1.0)
+
+    if context.in_transaction and destination:
+        action = ActionKind.ADDED if span.action is ActionKind.MOVED else span.action
+        confidence = _reuse_confidence(destination, context.repository_blocks)
+        if confidence is not None:
+            return replace(
+                span,
+                classification=Classification.AI_REUSED,
+                action=action,
+                confidence=confidence,
+            )
+        return replace(
+            span,
+            classification=Classification.AI_SKILL,
+            action=action,
+            confidence=1.0,
+        )
+
+    if not context.in_transaction and context.observer_healthy:
+        return replace(span, classification=Classification.MANUAL_CANDIDATE, confidence=1.0)
+
+    return replace(span, classification=Classification.UNKNOWN, confidence=0.0)
+
+
+def classify_spans(
+    spans: Iterable[PatchSpan],
+    context: ClassificationContext,
+) -> list[PatchSpan]:
+    """Classify spans according to the approved, uncertainty-preserving order."""
+
+    return [_classify_span(span, context) for span in spans]
