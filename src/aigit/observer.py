@@ -56,6 +56,12 @@ class _Reconciliation:
     uncertain_terminal: bool
 
 
+@dataclass(frozen=True)
+class _ActiveTransactionBoundary:
+    active: bool
+    snapshot: GitSnapshot | None
+
+
 class Observer:
     """Poll one repository without assigning external edits to an OS identity."""
 
@@ -96,8 +102,11 @@ class Observer:
             )
             self._started = True
             initial_fence = self._current_sequence()
-            active_snapshot = self._active_transaction_snapshot()
-            if active_snapshot is not None:
+            active_boundary = self._active_transaction_boundary()
+            if active_boundary.active:
+                active_snapshot = (
+                    active_boundary.snapshot or _unknown_startup_snapshot()
+                )
                 emitted.append(
                     self._emit(
                         "recovery_detected",
@@ -727,7 +736,7 @@ class Observer:
             connection.close()
         return row is not None
 
-    def _active_transaction_snapshot(self) -> GitSnapshot | None:
+    def _active_transaction_boundary(self) -> _ActiveTransactionBoundary:
         connection = self.store._connect()
         try:
             columns = {
@@ -737,31 +746,46 @@ class Observer:
                 ).fetchall()
             }
             if "snapshot_json" not in columns:
-                return None
-            row = connection.execute(
+                row = connection.execute(
+                    """
+                    SELECT 1 FROM active_transactions
+                    WHERE repo_id = ? LIMIT 1
+                    """,
+                    (self.repo_id,),
+                ).fetchone()
+                return _ActiveTransactionBoundary(row is not None, None)
+            snapshot_row = connection.execute(
                 """
                 SELECT snapshot_json FROM active_transactions
                 WHERE repo_id = ? LIMIT 1
                 """,
                 (self.repo_id,),
             ).fetchone()
+        except sqlite3.DatabaseError:
+            return _ActiveTransactionBoundary(True, None)
         finally:
             connection.close()
-        if row is None:
-            return None
+        if snapshot_row is None:
+            return _ActiveTransactionBoundary(False, None)
         try:
-            snapshot_data = json.loads(str(row[0]))
-            return GitSnapshot(
+            snapshot_data = json.loads(str(snapshot_row[0]))
+            if not isinstance(snapshot_data, dict):
+                raise TypeError("active snapshot must be an object")
+            files = snapshot_data.get("files")
+            if not isinstance(files, dict) or not all(
+                isinstance(path, str) and isinstance(reference, str)
+                for path, reference in files.items()
+            ):
+                raise TypeError("active snapshot files must be a string mapping")
+            snapshot = GitSnapshot(
                 head=str(snapshot_data["head"]),
                 index_hash=str(snapshot_data["index_hash"]),
                 worktree_hash=str(snapshot_data["worktree_hash"]),
-                files={
-                    str(path): str(reference)
-                    for path, reference in snapshot_data["files"].items()
-                },
+                files=dict(files),
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-            return _unknown_startup_snapshot()
+            return _ActiveTransactionBoundary(True, None)
+        return _ActiveTransactionBoundary(True, snapshot)
 
     def _current_sequence(self) -> int:
         connection = self.store._connect()

@@ -691,6 +691,90 @@ def test_initial_tick_uses_active_transaction_start_not_partial_worktree(
     assert len(transaction_patches) == 1
 
 
+def test_initial_tick_fails_closed_for_legacy_active_row_without_snapshot_column(
+    repo: Path,
+    state_root: Path,
+    clock: FakeClock,
+) -> None:
+    observer = Observer(repo, state_root=state_root)
+    with sqlite3.connect(observer.store.database_path) as connection:
+        columns = {
+            str(row[1])
+            for row in connection.execute(
+                "PRAGMA table_info(active_transactions)"
+            ).fetchall()
+        }
+        assert "snapshot_json" not in columns
+        connection.execute(
+            """
+            INSERT INTO active_transactions (
+                transaction_id, repo_id, session_id, started_at
+            ) VALUES (?, ?, ?, ?)
+            """,
+            ("legacy-active", observer.repo_id, "legacy-agent", clock.now().isoformat()),
+        )
+    (repo / "app.py").write_text(
+        "committed = 0\npartial_legacy_ai = 1\n", encoding="utf-8"
+    )
+
+    startup = observer.tick(clock.now())
+
+    recovery = _only_contribution(startup)
+    assert recovery.event_type == "recovery_detected"
+    assert recovery.payload["classification"] == "UNKNOWN"
+    assert recovery.payload["reason_code"] == "ACTIVE_TRANSACTION_AT_STARTUP"
+    assert _events_of_type(startup, "heartbeat")[0].payload["healthy"] is False
+    assert _events_of_type(startup, "workspace_edit") == []
+
+
+@pytest.mark.parametrize(
+    "malformed_snapshot",
+    [
+        pytest.param("not-json", id="invalid-json"),
+        pytest.param(
+            json.dumps(
+                {
+                    "head": "head",
+                    "index_hash": "index",
+                    "worktree_hash": "worktree",
+                    "files": [],
+                }
+            ),
+            id="non-mapping-files",
+        ),
+    ],
+)
+def test_initial_tick_fails_closed_for_malformed_active_snapshot(
+    repo: Path,
+    state_root: Path,
+    clock: FakeClock,
+    malformed_snapshot: str,
+) -> None:
+    recorder = Recorder(repo, state_root)
+    transaction_id = str(
+        recorder.begin("agent-corrupt-active-snapshot")["transaction_id"]
+    )
+    with sqlite3.connect(recorder.store.database_path) as connection:
+        connection.execute(
+            "UPDATE active_transactions SET snapshot_json = ? "
+            "WHERE transaction_id = ?",
+            (malformed_snapshot, transaction_id),
+        )
+    (repo / "app.py").write_text(
+        "committed = 0\npartial_corrupt_ai = 1\n", encoding="utf-8"
+    )
+    observer = Observer(repo, state_root=state_root)
+
+    startup = observer.tick(clock.now())
+
+    recovery = _only_contribution(startup)
+    assert recovery.event_type == "recovery_detected"
+    assert recovery.payload["classification"] == "UNKNOWN"
+    assert recovery.payload["reason_code"] == "ACTIVE_TRANSACTION_AT_STARTUP"
+    assert _events_of_type(startup, "heartbeat")[0].payload["healthy"] is False
+    assert _events_of_type(startup, "workspace_edit") == []
+
+
 def test_restart_replays_durable_contribution_boundary_without_double_counting(
     observer: Observer,
     clock: FakeClock,
