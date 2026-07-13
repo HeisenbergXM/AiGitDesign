@@ -50,6 +50,7 @@ class _Reconciliation:
     snapshot: GitSnapshot
     deltas: tuple[_ReconciledDelta, ...]
     ledger_sequence: int
+    uncertain_terminal: bool
 
 
 class Observer:
@@ -135,7 +136,18 @@ class Observer:
             )
 
         if self._has_active_transaction():
-            healthy = not state.coverage_uncertain
+            healthy = not gap
+            if gap:
+                emitted.append(
+                    self._emit(
+                        "recovery_detected",
+                        self._unknown_recovery_payload(
+                            state.snapshot,
+                            reason_code="HEARTBEAT_GAP",
+                        ),
+                        observed_at,
+                    )
+                )
             emitted.append(
                 self._heartbeat(state.snapshot, observed_at, healthy=healthy)
             )
@@ -145,13 +157,18 @@ class Observer:
                     observed_at,
                     observed_at if healthy else state.last_healthy_at,
                     state.ledger_sequence,
-                    state.coverage_uncertain,
+                    not healthy,
                 )
             )
             return emitted
 
-        reconciliation = self._reconcile_completed_transactions(state)
+        cycle_fence = self._current_sequence()
+        reconciliation = self._reconcile_completed_transactions(
+            state,
+            cycle_fence,
+        )
         baseline = reconciliation.snapshot
+        gap = gap or reconciliation.uncertain_terminal
         contribution_emitted = False
         for delta in reconciliation.deltas:
             grouped_delta: dict[str, list[PatchSpan]] = defaultdict(list)
@@ -177,7 +194,6 @@ class Observer:
                 )
                 contribution_emitted = True
 
-        capture_fence = self._current_sequence()
         try:
             current = capture_snapshot(self.repository, self.store)
             spans = diff_snapshots(baseline, current, self.store)
@@ -204,7 +220,7 @@ class Observer:
                     baseline,
                     observed_at,
                     state.last_healthy_at,
-                    self._current_sequence(),
+                    cycle_fence,
                     True,
                 )
             )
@@ -213,7 +229,18 @@ class Observer:
         # A transaction that began during capture owns this boundary. Do not
         # consume it or advance the persisted snapshot past it.
         if self._has_active_transaction():
-            healthy = not state.coverage_uncertain
+            healthy = not gap
+            if gap and not contribution_emitted:
+                emitted.append(
+                    self._emit(
+                        "recovery_detected",
+                        self._unknown_recovery_payload(
+                            baseline,
+                            reason_code="HEARTBEAT_GAP",
+                        ),
+                        observed_at,
+                    )
+                )
             emitted.append(
                 self._heartbeat(baseline, observed_at, healthy=healthy)
             )
@@ -222,15 +249,41 @@ class Observer:
                     baseline,
                     observed_at,
                     observed_at if healthy else state.last_healthy_at,
-                    capture_fence,
-                    state.coverage_uncertain,
+                    cycle_fence,
+                    not healthy,
                 )
             )
             return emitted
 
-        transaction_race = self._transaction_event_after(capture_fence)
+        post_capture_fence = self._current_sequence()
+        transaction_race = self._transaction_event_between(
+            cycle_fence,
+            post_capture_fence,
+        )
         if transaction_race:
-            gap = True
+            emitted.append(
+                self._emit(
+                    "recovery_detected",
+                    self._unknown_recovery_payload(
+                        baseline,
+                        reason_code="TRANSACTION_RACE",
+                    ),
+                    observed_at,
+                )
+            )
+            emitted.append(
+                self._heartbeat(baseline, observed_at, healthy=False)
+            )
+            self._save_state(
+                _ObserverState(
+                    baseline,
+                    observed_at,
+                    state.last_healthy_at,
+                    cycle_fence,
+                    True,
+                )
+            )
+            return emitted
 
         grouped: dict[str, list[PatchSpan]] = defaultdict(list)
         for span in spans:
@@ -279,11 +332,26 @@ class Observer:
                 current,
                 observed_at,
                 observed_at,
-                self._current_sequence(),
+                cycle_fence,
                 False,
             )
         )
         return emitted
+
+    @staticmethod
+    def _unknown_recovery_payload(
+        snapshot: GitSnapshot,
+        *,
+        reason_code: str,
+    ) -> dict[str, object]:
+        return {
+            "classification": Classification.UNKNOWN.value,
+            "normalized_lines": 0,
+            "dirty_diff_hash_before": snapshot.worktree_hash,
+            "dirty_diff_hash_after": None,
+            "spans": [],
+            "reason_code": reason_code,
+        }
 
     def _classify(
         self,
@@ -530,11 +598,14 @@ class Observer:
     def _reconcile_completed_transactions(
         self,
         state: _ObserverState,
+        upper_sequence: int,
     ) -> _Reconciliation:
         records = [
             record
             for record in self._ledger_records()
-            if int(record.get("sequence", 0)) > state.ledger_sequence
+            if state.ledger_sequence
+            < int(record.get("sequence", 0))
+            <= upper_sequence
         ]
         completed = {
             str(record.get("payload", {}).get("transaction_id"))
@@ -542,14 +613,19 @@ class Observer:
             if record.get("event_type") == "transaction_finished"
             and isinstance(record.get("payload"), dict)
         }
+        uncertain_terminal = any(
+            isinstance(record.get("payload"), dict)
+            and isinstance(record["payload"].get("transaction_id"), str)
+            and record.get("event_type")
+            in {"transaction_aborted", "recovery_detected"}
+            for record in records
+        )
         if not completed:
             return _Reconciliation(
                 state.snapshot,
                 (),
-                max(
-                    (int(record.get("sequence", 0)) for record in records),
-                    default=state.ledger_sequence,
-                ),
+                upper_sequence,
+                uncertain_terminal,
             )
 
         baseline = state.snapshot
@@ -639,13 +715,15 @@ class Observer:
         return _Reconciliation(
             baseline,
             tuple(deltas),
-            max(
-                (int(record.get("sequence", 0)) for record in records),
-                default=state.ledger_sequence,
-            ),
+            upper_sequence,
+            uncertain_terminal,
         )
 
-    def _transaction_event_after(self, sequence: int) -> bool:
+    def _transaction_event_between(
+        self,
+        lower_sequence: int,
+        upper_sequence: int,
+    ) -> bool:
         transaction_events = {
             "transaction_started",
             "patch_applied",
@@ -653,8 +731,20 @@ class Observer:
             "transaction_aborted",
         }
         return any(
-            int(record.get("sequence", 0)) > sequence
-            and record.get("event_type") in transaction_events
+            lower_sequence
+            < int(record.get("sequence", 0))
+            <= upper_sequence
+            and (
+                record.get("event_type") in transaction_events
+                or (
+                    record.get("event_type") == "recovery_detected"
+                    and isinstance(record.get("payload"), dict)
+                    and isinstance(
+                        record["payload"].get("transaction_id"),
+                        str,
+                    )
+                )
+            )
             for record in self._ledger_records()
         )
 

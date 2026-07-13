@@ -14,6 +14,7 @@ import pytest
 
 import aigit.observer as observer_module
 import aigit.process as process_module
+import aigit.recorder as recorder_module
 from aigit.domain import Event, GitSnapshot
 from aigit.git_state import MAX_FILE_BYTES, capture_snapshot, repo_id
 from aigit.observer import Observer
@@ -314,6 +315,174 @@ def test_transaction_completed_during_capture_is_never_manual_candidate(
     event = _only_contribution(observer.tick(clock.now()))
 
     assert event.payload["classification"] == "UNKNOWN"
+
+
+def test_transaction_completed_between_reconciliation_and_fence_is_not_manual(
+    observer: Observer,
+    clock: FakeClock,
+    repo: Path,
+    state_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observer.tick(clock.now())
+    recorder = Recorder(repo, state_root)
+    real_reconcile = observer._reconcile_completed_transactions
+    raced = False
+
+    def reconcile_then_complete(*args: object, **kwargs: object) -> object:
+        nonlocal raced
+        reconciled = real_reconcile(*args, **kwargs)
+        if not raced:
+            raced = True
+            transaction_id = str(
+                recorder.begin("agent-after-reconcile")["transaction_id"]
+            )
+            (repo / "app.py").write_text(
+                "committed = 0\nai_after_reconcile = 1\n", encoding="utf-8"
+            )
+            assert recorder.end(transaction_id, "passed")["ok"] is True
+        return reconciled
+
+    monkeypatch.setattr(
+        observer,
+        "_reconcile_completed_transactions",
+        reconcile_then_complete,
+    )
+    clock.advance(seconds=10)
+
+    first = _only_contribution(observer.tick(clock.now()))
+
+    assert first.payload["classification"] == "UNKNOWN"
+    monkeypatch.setattr(
+        observer,
+        "_reconcile_completed_transactions",
+        real_reconcile,
+    )
+    clock.advance(seconds=10)
+    second = _only_contribution(observer.tick(clock.now()))
+    assert second.payload["classification"] == "UNKNOWN"
+
+
+def test_transaction_completed_after_snapshot_does_not_advance_ledger_watermark(
+    observer: Observer,
+    clock: FakeClock,
+    repo: Path,
+    state_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observer.tick(clock.now())
+    recorder = Recorder(repo, state_root)
+    real_capture = observer_module.capture_snapshot
+    raced = False
+
+    def capture_then_complete(*args: object, **kwargs: object) -> GitSnapshot:
+        nonlocal raced
+        snapshot = real_capture(*args, **kwargs)
+        if not raced:
+            raced = True
+            transaction_id = str(
+                recorder.begin("agent-after-snapshot")["transaction_id"]
+            )
+            (repo / "app.py").write_text(
+                "committed = 0\nai_after_snapshot = 1\n", encoding="utf-8"
+            )
+            assert recorder.end(transaction_id, "passed")["ok"] is True
+        return snapshot
+
+    monkeypatch.setattr(observer_module, "capture_snapshot", capture_then_complete)
+    clock.advance(seconds=10)
+    first = _only_contribution(observer.tick(clock.now()))
+    assert first.payload["classification"] == "UNKNOWN"
+
+    monkeypatch.setattr(observer_module, "capture_snapshot", real_capture)
+    clock.advance(seconds=10)
+    second = _only_contribution(observer.tick(clock.now()))
+
+    assert second.payload["classification"] == "UNKNOWN"
+
+
+def test_gap_with_active_transaction_preserves_unknown_pretransaction_delta(
+    observer: Observer,
+    clock: FakeClock,
+    repo: Path,
+    state_root: Path,
+) -> None:
+    observer.tick(clock.now())
+    clock.advance(seconds=31)
+    (repo / "app.py").write_text(
+        "committed = 0\ngap_before_transaction = 1\n", encoding="utf-8"
+    )
+    recorder = Recorder(repo, state_root)
+    transaction_id = str(recorder.begin("agent-during-gap")["transaction_id"])
+    (repo / "app.py").write_text(
+        "committed = 0\ngap_before_transaction = 1\nai_in_transaction = 2\n",
+        encoding="utf-8",
+    )
+
+    active_tick = observer.tick(clock.now())
+
+    active_recovery = _only_contribution(active_tick)
+    assert active_recovery.event_type == "recovery_detected"
+    assert active_recovery.payload["classification"] == "UNKNOWN"
+    assert _events_of_type(active_tick, "heartbeat")[0].payload["healthy"] is False
+    assert recorder.end(transaction_id, "passed")["ok"] is True
+
+    clock.advance(seconds=10)
+    recovered = _only_contribution(observer.tick(clock.now()))
+    assert recovered.event_type == "recovery_detected"
+    assert recovered.payload["classification"] == "UNKNOWN"
+    assert recovered.payload["normalized_lines"] == 1
+
+
+def test_aborted_transaction_delta_is_unknown_not_manual_candidate(
+    observer: Observer,
+    clock: FakeClock,
+    repo: Path,
+    state_root: Path,
+) -> None:
+    observer.tick(clock.now())
+    recorder = Recorder(repo, state_root)
+    transaction_id = str(recorder.begin("agent-aborted-edit")["transaction_id"])
+    (repo / "app.py").write_text(
+        "committed = 0\npartial_before_abort = 1\n", encoding="utf-8"
+    )
+    assert recorder.abort(transaction_id, "apply interrupted")["ok"] is True
+    clock.advance(seconds=10)
+
+    event = _only_contribution(observer.tick(clock.now()))
+
+    assert event.event_type == "recovery_detected"
+    assert event.payload["classification"] == "UNKNOWN"
+    assert event.payload["normalized_lines"] == 1
+
+
+def test_transaction_scoped_degradation_delta_is_unknown(
+    observer: Observer,
+    clock: FakeClock,
+    repo: Path,
+    state_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observer.tick(clock.now())
+    recorder = Recorder(repo, state_root)
+    transaction_id = str(recorder.begin("agent-degraded-edit")["transaction_id"])
+    (repo / "app.py").write_text(
+        "committed = 0\nuncaptured_before_recovery = 1\n", encoding="utf-8"
+    )
+
+    def fail_recorder_capture(*_args: object, **_kwargs: object) -> GitSnapshot:
+        raise OSError("injected recorder capture failure")
+
+    monkeypatch.setattr(recorder_module, "capture_snapshot", fail_recorder_capture)
+    degraded = recorder.end(transaction_id, "failed")
+    assert degraded["coverage"] == "UNKNOWN"
+    clock.advance(seconds=10)
+
+    event = _only_contribution(observer.tick(clock.now()))
+
+    assert event.event_type == "recovery_detected"
+    assert event.payload["classification"] == "UNKNOWN"
+    assert event.payload["normalized_lines"] == 1
 
 
 def test_first_recovery_heartbeat_is_the_next_healthy_baseline(
