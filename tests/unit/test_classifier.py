@@ -284,3 +284,68 @@ def test_prompt_evidence_returns_maximal_contiguous_candidate_ranges() -> None:
     )
 
     assert ranges == ((0, 2), (3, 4))
+
+
+def test_partial_prompt_replacement_is_unknown_before_removed_source_match() -> None:
+    removed_source = RepositoryBlock(
+        "a.py",
+        MODULE_LINES,
+        Classification.MANUAL_CANDIDATE,
+    )
+    replacement = PatchSpan(
+        path="replacement.py",
+        old_start=4,
+        old_end=6,
+        new_start=8,
+        new_end=11,
+        old_lines=("old_first = 1", "old_second = 2"),
+        new_lines=MODULE_LINES,
+        classification=Classification.UNKNOWN,
+        action=ActionKind.REPLACED,
+        confidence=0.0,
+        old_path="a.py",
+    )
+
+    result = classify_spans(
+        (replacement,),
+        _context(
+            prompt_blocks=(MODULE_LINES[:2],),
+            repository_blocks=(removed_source,),
+            removed_blocks=(removed_source,),
+        ),
+    )
+
+    assert len(result) == 1
+    assert result[0].new_lines == MODULE_LINES
+    assert result[0].action is ActionKind.REPLACED
+    assert result[0].classification is Classification.UNKNOWN
+
+
+def test_added_partial_prompt_splits_before_removed_source_match() -> None:
+    removed_source = RepositoryBlock(
+        "a.py",
+        MODULE_LINES,
+        Classification.MANUAL_CANDIDATE,
+    )
+
+    result = classify_spans(
+        (PatchSpan.added("mixed.py", MODULE_LINES),),
+        _context(
+            prompt_blocks=(MODULE_LINES[:2],),
+            repository_blocks=(removed_source,),
+            removed_blocks=(removed_source,),
+        ),
+    )
+
+    assert len(result) == 2
+    supplied, generated = result
+    assert supplied.new_lines == MODULE_LINES[:2]
+    assert supplied.new_start == 0
+    assert supplied.new_end == 2
+    assert supplied.classification is Classification.USER_SUPPLIED
+    assert generated.new_lines == MODULE_LINES[2:]
+    assert generated.new_start == 2
+    assert generated.new_end == 3
+    assert generated.action is ActionKind.ADDED
+    assert generated.classification is Classification.AI_SKILL
+    assert supplied.new_lines + generated.new_lines == MODULE_LINES

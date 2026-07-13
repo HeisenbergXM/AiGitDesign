@@ -202,6 +202,17 @@ def _classify_span(
             )
         ]
 
+    if prompt_ranges:
+        if span.action is ActionKind.ADDED:
+            return _split_added_prompt_overlap(span, prompt_ranges, context)
+        return [
+            replace(
+                span,
+                classification=Classification.UNKNOWN,
+                confidence=0.0,
+            )
+        ]
+
     removed = _removed_source(span, context)
     if removed is not None:
         source, action = removed
@@ -219,17 +230,6 @@ def _classify_span(
         if span.action is ActionKind.MOVED
         else span
     )
-    if prompt_ranges:
-        if effective_span.action is ActionKind.ADDED:
-            return _split_added_prompt_overlap(effective_span, prompt_ranges, context)
-        return [
-            replace(
-                effective_span,
-                classification=Classification.UNKNOWN,
-                confidence=0.0,
-            )
-        ]
-
     return [_classify_without_prompt(effective_span, context)]
 
 
