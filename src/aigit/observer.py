@@ -36,6 +36,7 @@ class _ObserverState:
     last_heartbeat_at: datetime
     last_healthy_at: datetime
     ledger_sequence: int
+    observer_event_sequence: int
     coverage_uncertain: bool
 
 
@@ -44,6 +45,7 @@ class _ReconciledDelta:
     before: GitSnapshot
     after: GitSnapshot
     spans: tuple[PatchSpan, ...]
+    boundary_sequence: int
 
 
 @dataclass(frozen=True)
@@ -103,6 +105,7 @@ class Observer:
                         observed_at,
                         observed_at,
                         self._current_sequence(),
+                        self._current_sequence(),
                         True,
                     )
                 )
@@ -125,6 +128,7 @@ class Observer:
                         observed_at,
                         observed_at,
                         self._current_sequence(),
+                        self._current_sequence(),
                         True,
                     )
                 )
@@ -135,6 +139,7 @@ class Observer:
                     snapshot,
                     observed_at,
                     observed_at,
+                    self._current_sequence(),
                     self._current_sequence(),
                     False,
                 )
@@ -193,6 +198,7 @@ class Observer:
                     observed_at,
                     observed_at if healthy else state.last_healthy_at,
                     state.ledger_sequence,
+                    self._current_sequence(),
                     not healthy,
                 )
             )
@@ -224,6 +230,8 @@ class Observer:
                             delta.after,
                             path,
                             classified,
+                            boundary_sequence=delta.boundary_sequence,
+                            boundary_position="before",
                         ),
                         observed_at,
                     )
@@ -257,6 +265,7 @@ class Observer:
                     observed_at,
                     state.last_healthy_at,
                     cycle_fence,
+                    self._current_sequence(),
                     True,
                 )
             )
@@ -286,6 +295,7 @@ class Observer:
                     observed_at,
                     observed_at if healthy else state.last_healthy_at,
                     cycle_fence,
+                    self._current_sequence(),
                     not healthy,
                 )
             )
@@ -316,6 +326,7 @@ class Observer:
                     observed_at,
                     state.last_healthy_at,
                     cycle_fence,
+                    self._current_sequence(),
                     True,
                 )
             )
@@ -336,7 +347,14 @@ class Observer:
             emitted.append(
                 self._emit(
                     event_type,
-                    self._delta_payload(baseline, current, path, classified),
+                    self._delta_payload(
+                        baseline,
+                        current,
+                        path,
+                        classified,
+                        boundary_sequence=post_capture_fence,
+                        boundary_position="after",
+                    ),
                     observed_at,
                 )
             )
@@ -369,6 +387,7 @@ class Observer:
                 observed_at,
                 observed_at,
                 cycle_fence,
+                self._current_sequence(),
                 False,
             )
         )
@@ -412,6 +431,9 @@ class Observer:
         after: GitSnapshot,
         path: str,
         spans: list[PatchSpan],
+        *,
+        boundary_sequence: int,
+        boundary_position: str,
     ) -> dict[str, object]:
         classifications = {span.classification.value for span in spans}
         classification = (
@@ -445,6 +467,8 @@ class Observer:
                 1 for span in spans for line in span.new_lines if line.rstrip()
             ),
             "spans": span_evidence,
+            "boundary_sequence": boundary_sequence,
+            "boundary_position": boundary_position,
         }
 
     def _heartbeat(
@@ -515,6 +539,7 @@ class Observer:
                     last_heartbeat_at TEXT NOT NULL,
                     last_healthy_at TEXT NOT NULL,
                     coverage_uncertain INTEGER NOT NULL DEFAULT 0,
+                    observer_event_sequence INTEGER NOT NULL DEFAULT 0,
                     ledger_sequence INTEGER NOT NULL
                 )
                 """
@@ -537,6 +562,15 @@ class Observer:
                     "ALTER TABLE observer_state ADD COLUMN coverage_uncertain "
                     "INTEGER NOT NULL DEFAULT 0"
                 )
+            if "observer_event_sequence" not in columns:
+                connection.execute(
+                    "ALTER TABLE observer_state ADD COLUMN "
+                    "observer_event_sequence INTEGER NOT NULL DEFAULT 0"
+                )
+                connection.execute(
+                    "UPDATE observer_state SET observer_event_sequence = "
+                    "ledger_sequence"
+                )
             connection.commit()
         finally:
             connection.close()
@@ -547,7 +581,8 @@ class Observer:
             row = connection.execute(
                 """
                 SELECT snapshot_json, last_heartbeat_at, last_healthy_at,
-                       ledger_sequence, coverage_uncertain
+                       ledger_sequence, observer_event_sequence,
+                       coverage_uncertain
                 FROM observer_state WHERE repo_id = ?
                 """,
                 (self.repo_id,),
@@ -570,10 +605,18 @@ class Observer:
             heartbeat = _parse_timestamp(str(row[1]))
             healthy = _parse_timestamp(str(row[2]))
             sequence = int(row[3])
-            uncertain = bool(int(row[4]))
+            observer_sequence = int(row[4])
+            uncertain = bool(int(row[5]))
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise RuntimeError("observer state is corrupt") from exc
-        return _ObserverState(snapshot, heartbeat, healthy, sequence, uncertain)
+        return _ObserverState(
+            snapshot,
+            heartbeat,
+            healthy,
+            sequence,
+            observer_sequence,
+            uncertain,
+        )
 
     def _save_state(self, state: _ObserverState) -> None:
         snapshot_json = canonical_json(asdict(state.snapshot)).decode("utf-8")
@@ -584,13 +627,15 @@ class Observer:
                 """
                 INSERT INTO observer_state (
                     repo_id, snapshot_json, last_heartbeat_at, last_healthy_at,
-                    ledger_sequence, coverage_uncertain
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    ledger_sequence, observer_event_sequence,
+                    coverage_uncertain
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(repo_id) DO UPDATE SET
                     snapshot_json = excluded.snapshot_json,
                     last_heartbeat_at = excluded.last_heartbeat_at,
                     last_healthy_at = excluded.last_healthy_at,
                     ledger_sequence = excluded.ledger_sequence,
+                    observer_event_sequence = excluded.observer_event_sequence,
                     coverage_uncertain = excluded.coverage_uncertain
                 """,
                 (
@@ -599,6 +644,7 @@ class Observer:
                     _timestamp(state.last_heartbeat_at),
                     _timestamp(state.last_healthy_at),
                     state.ledger_sequence,
+                    state.observer_event_sequence,
                     int(state.coverage_uncertain),
                 ),
             )
@@ -639,9 +685,19 @@ class Observer:
         records = [
             record
             for record in self._ledger_records()
-            if state.ledger_sequence
-            < int(record.get("sequence", 0))
-            <= upper_sequence
+            if int(record.get("sequence", 0)) <= upper_sequence
+            and (
+                (
+                    record.get("session_id") == _OBSERVER_SESSION
+                    and int(record.get("sequence", 0))
+                    > state.observer_event_sequence
+                )
+                or (
+                    record.get("session_id") != _OBSERVER_SESSION
+                    and int(record.get("sequence", 0))
+                    > state.ledger_sequence
+                )
+            )
         ]
         for record in records:
             if record.get("session_id") == _OBSERVER_SESSION:
@@ -683,7 +739,7 @@ class Observer:
         ]
         actions = sorted(
             [*finished_records, *observer_boundaries],
-            key=lambda record: int(record.get("sequence", 0)),
+            key=self._boundary_action_key,
         )
         for finished in actions:
             if finished.get("session_id") == _OBSERVER_SESSION:
@@ -732,6 +788,7 @@ class Observer:
                         baseline,
                         transaction_before,
                         external_spans,
+                        int(finished.get("sequence", 0)),
                     )
                 )
 
@@ -767,6 +824,25 @@ class Observer:
             upper_sequence,
             uncertain_terminal,
         )
+
+    @staticmethod
+    def _boundary_action_key(
+        record: dict[str, Any],
+    ) -> tuple[int, int, int]:
+        ledger_sequence = int(record.get("sequence", 0))
+        if record.get("session_id") != _OBSERVER_SESSION:
+            return (ledger_sequence, 1, ledger_sequence)
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            return (ledger_sequence, 2, ledger_sequence)
+        boundary_sequence = payload.get("boundary_sequence")
+        semantic_sequence = (
+            int(boundary_sequence)
+            if isinstance(boundary_sequence, int)
+            else ledger_sequence
+        )
+        priority = 0 if payload.get("boundary_position") == "before" else 2
+        return (semantic_sequence, priority, ledger_sequence)
 
     def _apply_observer_boundary(
         self,

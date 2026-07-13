@@ -629,6 +629,78 @@ def test_restart_replays_durable_contribution_boundary_without_double_counting(
     assert after_restart[0]["payload"]["classification"] == "MANUAL_CANDIDATE"
 
 
+def test_replay_keeps_capture_boundary_before_transaction_appended_first(
+    observer: Observer,
+    clock: FakeClock,
+    repo: Path,
+    state_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observer.tick(clock.now())
+    (repo / "app.py").write_text(
+        "committed = 0\nexternal_before_late_transaction = 1\n",
+        encoding="utf-8",
+    )
+    recorder = Recorder(repo, state_root)
+    real_emit = observer._emit
+    transaction_completed = False
+
+    def complete_transaction_before_observer_append(
+        event_type: str,
+        payload: dict[str, object],
+        now: datetime,
+    ) -> Event:
+        nonlocal transaction_completed
+        if event_type == "workspace_edit" and not transaction_completed:
+            transaction_completed = True
+            transaction_id = str(
+                recorder.begin("agent-before-observer-append")["transaction_id"]
+            )
+            (repo / "app.py").write_text(
+                "committed = 0\n"
+                "external_before_late_transaction = 1\n"
+                "ai_after_captured_snapshot = 2\n",
+                encoding="utf-8",
+            )
+            assert recorder.end(transaction_id, "passed")["ok"] is True
+        return real_emit(event_type, payload, now)
+
+    monkeypatch.setattr(
+        observer,
+        "_emit",
+        complete_transaction_before_observer_append,
+    )
+    clock.advance(seconds=10)
+    first_tick = observer.tick(clock.now())
+    first = _only_contribution(first_tick)
+    assert first.payload["classification"] == "MANUAL_CANDIDATE"
+    assert first.payload["normalized_lines"] == 1
+    assert transaction_completed is True
+
+    clock.advance(seconds=10)
+    restarted = Observer(repo, state_root=state_root)
+    restart_tick = restarted.tick(clock.now())
+
+    assert [
+        event
+        for event in restart_tick
+        if event.event_type in {"workspace_edit", "recovery_detected"}
+        and event.payload.get("path") == "app.py"
+    ] == []
+    observer_path_events = [
+        record
+        for record in _ledger_records(repo, state_root)
+        if record["session_id"] == "observer"
+        and record["event_type"] in {"workspace_edit", "recovery_detected"}
+        and record["payload"].get("path") == "app.py"
+    ]
+    assert len(observer_path_events) == 1
+    assert observer_path_events[0]["payload"]["normalized_lines"] == 1
+    assert observer_path_events[0]["payload"]["classification"] == (
+        "MANUAL_CANDIDATE"
+    )
+
+
 def test_restart_repairs_queue_after_contribution_append_queue_failure(
     observer: Observer,
     clock: FakeClock,
