@@ -532,6 +532,159 @@ def test_persisted_heartbeat_and_snapshot_survive_process_restart(
     assert event.payload["normalized_lines"] == 1
 
 
+def test_startup_capture_failure_is_durable_unknown_until_recovery(
+    repo: Path,
+    state_root: Path,
+    clock: FakeClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_capture = observer_module.capture_snapshot
+
+    def fail_startup_capture(*_args: object, **_kwargs: object) -> GitSnapshot:
+        raise OSError("injected startup capture failure")
+
+    monkeypatch.setattr(
+        observer_module,
+        "capture_snapshot",
+        fail_startup_capture,
+    )
+    observer = Observer(repo, state_root=state_root)
+
+    startup = observer.tick(clock.now())
+
+    assert len(_events_of_type(startup, "observer_started")) == 1
+    startup_recovery = _only_contribution(startup)
+    assert startup_recovery.event_type == "recovery_detected"
+    assert startup_recovery.payload["classification"] == "UNKNOWN"
+    assert startup_recovery.payload["reason_code"] == "STARTUP_CAPTURE_FAILED"
+    assert _events_of_type(startup, "heartbeat")[0].payload["healthy"] is False
+
+    monkeypatch.setattr(observer_module, "capture_snapshot", real_capture)
+    (repo / "app.py").write_text(
+        "committed = 0\nunknown_startup_interval = 1\n", encoding="utf-8"
+    )
+    clock.advance(seconds=10)
+    recovered = observer.tick(clock.now())
+
+    contributions = [
+        event
+        for event in recovered
+        if event.event_type in {"workspace_edit", "recovery_detected"}
+        and "path" in event.payload
+    ]
+    assert contributions
+    assert {event.payload["classification"] for event in contributions} == {
+        "UNKNOWN"
+    }
+    assert _events_of_type(recovered, "workspace_edit") == []
+
+
+def test_restart_replays_durable_contribution_boundary_without_double_counting(
+    observer: Observer,
+    clock: FakeClock,
+    repo: Path,
+    state_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observer.tick(clock.now())
+    (repo / "app.py").write_text(
+        "committed = 0\nonce_only = 1\n", encoding="utf-8"
+    )
+    real_save = observer._save_state
+
+    def fail_boundary_save(_state: object) -> None:
+        raise OSError("injected event/state boundary crash")
+
+    monkeypatch.setattr(observer, "_save_state", fail_boundary_save)
+    clock.advance(seconds=10)
+    with pytest.raises(OSError, match="event/state boundary crash"):
+        observer.tick(clock.now())
+
+    before_restart = [
+        record
+        for record in _ledger_records(repo, state_root)
+        if record["event_type"] == "workspace_edit"
+        and record["payload"].get("path") == "app.py"
+    ]
+    assert len(before_restart) == 1
+    monkeypatch.setattr(observer, "_save_state", real_save)
+
+    clock.advance(seconds=10)
+    restarted = Observer(repo, state_root=state_root)
+    restart_events = restarted.tick(clock.now())
+
+    assert [
+        event
+        for event in restart_events
+        if event.event_type in {"workspace_edit", "recovery_detected"}
+        and event.payload.get("path") == "app.py"
+    ] == []
+    after_restart = [
+        record
+        for record in _ledger_records(repo, state_root)
+        if record["event_type"] == "workspace_edit"
+        and record["payload"].get("path") == "app.py"
+    ]
+    assert len(after_restart) == 1
+    assert after_restart[0]["payload"]["classification"] == "MANUAL_CANDIDATE"
+
+
+def test_restart_repairs_queue_after_contribution_append_queue_failure(
+    observer: Observer,
+    clock: FakeClock,
+    repo: Path,
+    state_root: Path,
+) -> None:
+    observer.tick(clock.now())
+    (repo / "app.py").write_text(
+        "committed = 0\nqueue_once = 1\n", encoding="utf-8"
+    )
+    database = _state_path(repo, state_root) / "state.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER reject_observer_workspace_queue
+            BEFORE INSERT ON upload_queue
+            WHEN instr(
+                CAST(NEW.event_json AS TEXT),
+                '"event_type":"workspace_edit"'
+            ) > 0
+            BEGIN
+                SELECT RAISE(FAIL, 'injected observer queue failure');
+            END
+            """
+        )
+    clock.advance(seconds=10)
+
+    with pytest.raises(sqlite3.DatabaseError, match="observer queue failure"):
+        observer.tick(clock.now())
+
+    appended = [
+        record
+        for record in _ledger_records(repo, state_root)
+        if record["event_type"] == "workspace_edit"
+        and record["payload"].get("path") == "app.py"
+    ]
+    assert len(appended) == 1
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP TRIGGER reject_observer_workspace_queue")
+
+    clock.advance(seconds=10)
+    restarted = Observer(repo, state_root=state_root)
+    restarted.tick(clock.now())
+
+    after_restart = [
+        record
+        for record in _ledger_records(repo, state_root)
+        if record["event_type"] == "workspace_edit"
+        and record["payload"].get("path") == "app.py"
+    ]
+    assert len(after_restart) == 1
+    assert appended[0]["event_id"] in {
+        record["event_id"] for record in _queued_records(repo, state_root)
+    }
+
+
 def test_restart_after_crash_records_lifecycle_and_only_gap_delta(
     repo: Path,
     state_root: Path,

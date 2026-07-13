@@ -27,6 +27,7 @@ HEALTHY_WINDOW_SECONDS = 30
 _OBSERVER_SESSION = "observer"
 _EVENT_NAMESPACE = UUID("f733871b-bdf8-46f6-a27c-334ea37473d7")
 _EMPTY_PROMPT_EVIDENCE_KEY = b"aigit-observer-empty-evidence"
+_UNKNOWN_STARTUP_HASH = hash_bytes(b"aigit:unknown-startup-boundary")
 
 
 @dataclass(frozen=True)
@@ -81,7 +82,6 @@ class Observer:
 
         emitted: list[Event] = []
         if state is None:
-            snapshot = capture_snapshot(self.repository, self.store)
             emitted.append(
                 self._emit(
                     "observer_started",
@@ -93,6 +93,42 @@ class Observer:
                 )
             )
             self._started = True
+            try:
+                snapshot = capture_snapshot(self.repository, self.store)
+            except Exception:
+                snapshot = _unknown_startup_snapshot()
+                self._save_state(
+                    _ObserverState(
+                        snapshot,
+                        observed_at,
+                        observed_at,
+                        self._current_sequence(),
+                        True,
+                    )
+                )
+                emitted.append(
+                    self._emit(
+                        "recovery_detected",
+                        self._unknown_recovery_payload(
+                            snapshot,
+                            reason_code="STARTUP_CAPTURE_FAILED",
+                        ),
+                        observed_at,
+                    )
+                )
+                emitted.append(
+                    self._heartbeat(snapshot, observed_at, healthy=False)
+                )
+                self._save_state(
+                    _ObserverState(
+                        snapshot,
+                        observed_at,
+                        observed_at,
+                        self._current_sequence(),
+                        True,
+                    )
+                )
+                return emitted
             emitted.append(self._heartbeat(snapshot, observed_at))
             self._save_state(
                 _ObserverState(
@@ -607,12 +643,9 @@ class Observer:
             < int(record.get("sequence", 0))
             <= upper_sequence
         ]
-        completed = {
-            str(record.get("payload", {}).get("transaction_id"))
-            for record in records
-            if record.get("event_type") == "transaction_finished"
-            and isinstance(record.get("payload"), dict)
-        }
+        for record in records:
+            if record.get("session_id") == _OBSERVER_SESSION:
+                self._ensure_queued_record(record)
         uncertain_terminal = any(
             isinstance(record.get("payload"), dict)
             and isinstance(record["payload"].get("transaction_id"), str)
@@ -620,14 +653,13 @@ class Observer:
             in {"transaction_aborted", "recovery_detected"}
             for record in records
         )
-        if not completed:
-            return _Reconciliation(
-                state.snapshot,
-                (),
-                upper_sequence,
-                uncertain_terminal,
-            )
-
+        uncertain_terminal = uncertain_terminal or any(
+            record.get("session_id") == _OBSERVER_SESSION
+            and record.get("event_type") == "recovery_detected"
+            and isinstance(record.get("payload"), dict)
+            and not isinstance(record["payload"].get("path"), str)
+            for record in records
+        )
         baseline = state.snapshot
         deltas: list[_ReconciledDelta] = []
         finished_records = sorted(
@@ -639,7 +671,24 @@ class Observer:
             ),
             key=lambda record: int(record.get("sequence", 0)),
         )
-        for finished in finished_records:
+        observer_boundaries = [
+            record
+            for record in records
+            if record.get("session_id") == _OBSERVER_SESSION
+            and record.get("event_type")
+            in {"workspace_edit", "recovery_detected"}
+            and isinstance(record.get("payload"), dict)
+            and isinstance(record["payload"].get("path"), str)
+            and "after_blob" in record["payload"]
+        ]
+        actions = sorted(
+            [*finished_records, *observer_boundaries],
+            key=lambda record: int(record.get("sequence", 0)),
+        )
+        for finished in actions:
+            if finished.get("session_id") == _OBSERVER_SESSION:
+                baseline = self._apply_observer_boundary(baseline, finished)
+                continue
             finished_payload = finished["payload"]
             transaction_id = str(finished_payload.get("transaction_id"))
             patches = [
@@ -719,6 +768,56 @@ class Observer:
             uncertain_terminal,
         )
 
+    def _apply_observer_boundary(
+        self,
+        baseline: GitSnapshot,
+        record: dict[str, Any],
+    ) -> GitSnapshot:
+        payload = record["payload"]
+        path = str(payload["path"])
+        files = dict(baseline.files)
+        after_blob = payload.get("after_blob")
+        if isinstance(after_blob, str):
+            files[path] = after_blob
+        elif after_blob is None:
+            files.pop(path, None)
+        head_after = payload.get("head_after")
+        dirty_after = payload.get("dirty_diff_hash_after")
+        return GitSnapshot(
+            head=(
+                str(head_after)
+                if isinstance(head_after, str)
+                else baseline.head
+            ),
+            index_hash=baseline.index_hash,
+            worktree_hash=(
+                str(dirty_after)
+                if isinstance(dirty_after, str)
+                else baseline.worktree_hash
+            ),
+            files=files,
+        )
+
+    def _ensure_queued_record(self, record: dict[str, Any]) -> None:
+        event_id = record.get("event_id")
+        if not isinstance(event_id, str):
+            return
+        connection = self.store._connect()
+        try:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO upload_queue (event_id, event_json)
+                VALUES (?, ?)
+                """,
+                (event_id, canonical_json(record)),
+            )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def _transaction_event_between(
         self,
         lower_sequence: int,
@@ -770,6 +869,15 @@ def _path_is_ambiguous(
     return any(
         isinstance(reference, str) and reference.startswith("unknown:")
         for reference in (before.files.get(path), after.files.get(path))
+    )
+
+
+def _unknown_startup_snapshot() -> GitSnapshot:
+    return GitSnapshot(
+        head="unknown",
+        index_hash=_UNKNOWN_STARTUP_HASH,
+        worktree_hash=_UNKNOWN_STARTUP_HASH,
+        files={},
     )
 
 
