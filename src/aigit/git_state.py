@@ -53,10 +53,14 @@ _LOCKFILES = frozenset(
         "cargo.lock",
         "composer.lock",
         "gemfile.lock",
+        "mix.lock",
         "package-lock.json",
+        "packages.lock.json",
         "pipfile.lock",
         "pnpm-lock.yaml",
+        "podfile.lock",
         "poetry.lock",
+        "pubspec.lock",
         "uv.lock",
         "yarn.lock",
     }
@@ -195,8 +199,8 @@ def diff_snapshots(
                     old_end=old_end,
                     new_start=new_start,
                     new_end=new_end,
-                    old_lines=old_lines[old_start:old_end],
-                    new_lines=new_lines[new_start:new_end],
+                    old_lines=_normalize_lines(old_lines[old_start:old_end]),
+                    new_lines=_normalize_lines(new_lines[new_start:new_end]),
                     classification=Classification.UNKNOWN,
                     action=_action_for(operation),
                     confidence=0.0,
@@ -329,7 +333,13 @@ def _is_binary(data: bytes) -> bool:
 def _blob_lines(store: LocalStore, reference: str | None) -> tuple[str, ...]:
     if reference is None:
         return ()
-    return tuple(store.get_blob(reference).decode("utf-8").splitlines())
+    return tuple(
+        store.get_blob(reference).decode("utf-8").splitlines(keepends=True)
+    )
+
+
+def _normalize_lines(lines: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(line.rstrip("\r\n") for line in lines)
 
 
 def _unknown_span(
