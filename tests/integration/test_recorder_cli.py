@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import time
@@ -201,6 +202,8 @@ def test_begin_deletes_valid_prompt_evidence(
         json.dumps(
             {
                 "fingerprints": [],
+                "counts": [],
+                "line_fingerprints": [],
                 "normalized_line_count": 0,
                 "normalized_token_count": 0,
             }
@@ -248,6 +251,164 @@ def test_begin_deletes_invalid_prompt_evidence(
     assert result.returncode != 0
     assert payload["ok"] is False
     assert not evidence.exists()
+
+
+def test_begin_deletes_prompt_evidence_when_session_is_empty(
+    repo: Path,
+    cli_env: dict[str, str],
+    tmp_path: Path,
+) -> None:
+    evidence = tmp_path / "prompt-evidence.json"
+    evidence.write_text(
+        json.dumps(
+            {
+                "fingerprints": [],
+                "counts": [],
+                "line_fingerprints": [],
+                "normalized_line_count": 0,
+                "normalized_token_count": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result, payload = invoke(
+        cli_env,
+        "begin",
+        "--repo",
+        repo,
+        "--session",
+        "",
+        "--prompt-evidence",
+        evidence,
+        "--json",
+    )
+
+    assert result.returncode != 0
+    assert payload["error"] == "INVALID_ARGUMENT"
+    assert not evidence.exists()
+
+
+def test_begin_deletes_prompt_evidence_when_recorder_initialization_fails(
+    cli_env: dict[str, str],
+    tmp_path: Path,
+) -> None:
+    evidence = tmp_path / "prompt-evidence.json"
+    evidence.write_text(
+        json.dumps(
+            {
+                "fingerprints": [],
+                "counts": [],
+                "line_fingerprints": [],
+                "normalized_line_count": 0,
+                "normalized_token_count": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    not_a_repository = tmp_path / "not-a-repository"
+    not_a_repository.mkdir()
+
+    result, payload = invoke(
+        cli_env,
+        "begin",
+        "--repo",
+        not_a_repository,
+        "--session",
+        "s-1",
+        "--prompt-evidence",
+        evidence,
+        "--json",
+    )
+
+    assert result.returncode == 0
+    assert payload["status"] == "unavailable"
+    assert not evidence.exists()
+
+
+def test_recorder_constructor_lock_is_fail_open_in_under_500_ms(
+    repo: Path,
+    cli_env: dict[str, str],
+) -> None:
+    initialized, _ = invoke(cli_env, "status", "--repo", repo, "--json")
+    assert initialized.returncode == 0
+    state_root = Path(cli_env["AIGIT_STATE_DIR"])
+    database_path = next(state_root.rglob("state.sqlite3"))
+    blocker = sqlite3.connect(database_path)
+    blocker.execute("BEGIN EXCLUSIVE")
+    try:
+        started = time.perf_counter()
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "aigit.cli",
+                "status",
+                "--repo",
+                str(repo),
+                "--json",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=cli_env,
+            timeout=2,
+        )
+        elapsed = time.perf_counter() - started
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+    payload = json.loads(result.stdout)
+    assert result.returncode == 0
+    assert payload["status"] == "unavailable"
+    assert elapsed < 0.5
+
+
+def test_report_labels_counts_as_lifetime_ledger_not_revision_stock(
+    repo: Path,
+    cli_env: dict[str, str],
+) -> None:
+    initial_revision = subprocess.run(
+        ["git", "-C", repo, "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    begin_result, begun = invoke(
+        cli_env, "begin", "--repo", repo, "--session", "s-1", "--json"
+    )
+    assert begin_result.returncode == 0
+    (repo / "dirty.py").write_text("generated_after_revision = 1\n", encoding="utf-8")
+    end_result, ended = invoke(
+        cli_env,
+        "end",
+        "--repo",
+        repo,
+        "--transaction",
+        begun["transaction_id"],
+        "--validation",
+        "passed",
+        "--json",
+    )
+    assert end_result.returncode == 0
+    assert ended["counts"] == {"AI_SKILL": 1}
+
+    report_result, report = invoke(
+        cli_env,
+        "report",
+        "--repo",
+        repo,
+        "--rev",
+        initial_revision,
+        "--json",
+    )
+
+    assert report_result.returncode == 0
+    assert report["scope"] == "lifetime_local_ledger"
+    assert report["counts"] == {"AI_SKILL": 1}
+    assert report["revision_stock_status"] == "unavailable"
+    assert "revision_stock" not in report
 
 
 def test_auxiliary_commands_emit_json_and_linking_preserves_counts(

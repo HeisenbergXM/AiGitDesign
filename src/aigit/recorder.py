@@ -7,10 +7,11 @@ from dataclasses import asdict, dataclass, replace
 import json
 import os
 from pathlib import Path
+import secrets
 import sqlite3
 import subprocess
 from typing import Any, Iterable
-from uuid import uuid4
+from uuid import UUID, uuid4, uuid5
 
 from aigit.canonical import canonical_json, hash_bytes
 from aigit.classifier import (
@@ -42,6 +43,26 @@ class _ActiveTransaction:
     prompt_metadata: dict[str, object]
 
 
+@dataclass(frozen=True)
+class _TerminalPlan:
+    events: tuple[Event, ...]
+    result: dict[str, object]
+
+
+SQLITE_TIMEOUT_SECONDS = 0.2
+SQLITE_INITIALIZATION_TIMEOUT_SECONDS = 0.01
+_EVENT_NAMESPACE = UUID("7a207a4d-e4df-49a6-a976-75ef255f33aa")
+_PROMPT_EVIDENCE_KEYS = frozenset(
+    {
+        "fingerprints",
+        "counts",
+        "normalized_line_count",
+        "normalized_token_count",
+        "line_fingerprints",
+    }
+)
+
+
 class Recorder:
     """Delimit apply transactions and persist their evidence locally."""
 
@@ -54,8 +75,57 @@ class Recorder:
         self.repo_id = repo_id(self.repository)
         configured_root = state_root or os.environ.get("AIGIT_STATE_DIR")
         root = Path(configured_root) if configured_root else Path.home() / ".aigit"
-        self.store = LocalStore(root / self.repo_id.removeprefix("sha256:"))
+        self._sqlite_timeout = SQLITE_INITIALIZATION_TIMEOUT_SECONDS
+        self.store = LocalStore(
+            root / self.repo_id.removeprefix("sha256:"),
+            connection_timeout=SQLITE_INITIALIZATION_TIMEOUT_SECONDS,
+        )
         self._migrate_active_transactions()
+        self._sqlite_timeout = SQLITE_TIMEOUT_SECONDS
+        self.store.connection_timeout = SQLITE_TIMEOUT_SECONDS
+        self._prompt_hmac_key = self._load_or_create_prompt_hmac_key()
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(
+            self.store.database_path,
+            timeout=self._sqlite_timeout,
+        )
+
+    def _load_or_create_prompt_hmac_key(self) -> bytes:
+        configured = os.environ.get("AIGIT_PROMPT_HMAC_KEY")
+        if configured is not None:
+            try:
+                key = bytes.fromhex(configured)
+            except ValueError as exc:
+                raise ValueError(
+                    "AIGIT_PROMPT_HMAC_KEY must be hexadecimal"
+                ) from exc
+            if not key:
+                raise ValueError("AIGIT_PROMPT_HMAC_KEY must not be empty")
+            return key
+
+        key_path = self.store.state_path / "prompt-hmac.key"
+        try:
+            key = key_path.read_bytes()
+        except FileNotFoundError:
+            generated = secrets.token_bytes(32)
+            try:
+                descriptor = os.open(
+                    key_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+            except FileExistsError:
+                key = key_path.read_bytes()
+            else:
+                with os.fdopen(descriptor, "wb") as destination:
+                    destination.write(generated)
+                    destination.flush()
+                    os.fsync(destination.fileno())
+                key = generated
+        if len(key) < 16:
+            raise RecorderStateError("prompt HMAC key state is corrupt")
+        return key
 
     def begin(
         self,
@@ -64,14 +134,14 @@ class Recorder:
     ) -> dict[str, object]:
         """Capture the transaction boundary, deleting temporary evidence always."""
 
-        if not session_id.strip():
-            raise InvalidRecorderInput("session must not be empty")
         evidence_path = (
             Path(prompt_evidence_path) if prompt_evidence_path is not None else None
         )
         try:
+            if not session_id.strip():
+                raise InvalidRecorderInput("session must not be empty")
             prompt_metadata = self._read_prompt_metadata(evidence_path)
-            connection = sqlite3.connect(self.store.database_path, timeout=0.25)
+            connection = self._connect()
             try:
                 try:
                     connection.execute("BEGIN IMMEDIATE")
@@ -146,22 +216,42 @@ class Recorder:
             }
         finally:
             if evidence_path is not None:
-                evidence_path.unlink(missing_ok=True)
+                try:
+                    evidence_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def end(self, transaction_id: str, validation: str) -> dict[str, object]:
         """Record only the net snapshot delta produced by one transaction."""
 
         if validation not in {"passed", "failed", "not-run"}:
             raise InvalidRecorderInput("validation must be passed, failed, or not-run")
-        active = self._load_active(transaction_id)
+        operation = f"end:{validation}"
+        claimed = self._claim_terminal(transaction_id, operation)
+        if isinstance(claimed, dict):
+            return claimed
+        active = claimed
+        existing_plan = self._load_terminal_plan(transaction_id, operation)
+        if isinstance(existing_plan, dict):
+            return existing_plan
+        if existing_plan is not None:
+            return self._execute_terminal_plan(
+                transaction_id,
+                operation,
+                existing_plan,
+            )
         after = capture_snapshot(self.repository, self.store)
         raw_spans = diff_snapshots(active.snapshot, after, self.store)
-        classified = self._classify(raw_spans, active.snapshot)
+        classified = self._classify(
+            raw_spans,
+            active.snapshot,
+            active.prompt_metadata,
+        )
         grouped: dict[str, list[PatchSpan]] = defaultdict(list)
         for span in classified:
             grouped[span.path].append(span)
 
-        event_ids: list[str] = []
+        events: list[Event] = []
         total_counts: dict[str, int] = defaultdict(int)
         for path in sorted(grouped):
             spans = grouped[path]
@@ -176,20 +266,18 @@ class Recorder:
                 counts,
                 validation,
             )
-            appended = self._append_and_enqueue(
-                Event.new(
-                    self.repo_id,
-                    active.session_id,
+            events.append(
+                self._planned_event(
+                    active,
                     "patch_applied",
                     payload,
+                    f"patch:{path}",
                 )
             )
-            event_ids.append(appended.event_id)
 
-        finished = self._append_and_enqueue(
-            Event.new(
-                self.repo_id,
-                active.session_id,
+        events.append(
+            self._planned_event(
+                active,
                 "transaction_finished",
                 {
                     "transaction_id": active.transaction_id,
@@ -198,44 +286,80 @@ class Recorder:
                     "validation": validation,
                     "counts": dict(sorted(total_counts.items())),
                 },
+                "finished",
             )
         )
-        event_ids.append(finished.event_id)
-        self._clear_active(active.transaction_id)
-        return {
+        result = {
             "ok": True,
             "status": "local-only",
-            "event_ids": event_ids,
+            "event_ids": [event.event_id for event in events],
             "queue_status": "pending",
             "counts": dict(sorted(total_counts.items())),
         }
+        prepared = self._store_or_load_terminal_plan(
+            active.transaction_id,
+            operation,
+            _TerminalPlan(tuple(events), result),
+        )
+        if isinstance(prepared, dict):
+            return prepared
+        return self._execute_terminal_plan(
+            active.transaction_id,
+            operation,
+            prepared,
+        )
 
     def abort(self, transaction_id: str, reason: str) -> dict[str, object]:
         """Clear a transaction and record no patch contribution."""
 
-        active = self._load_active(transaction_id)
-        aborted = self._append_and_enqueue(
-            Event.new(
-                self.repo_id,
-                active.session_id,
-                "transaction_aborted",
-                {
-                    "transaction_id": transaction_id,
-                    "reason": reason,
-                },
+        operation = "abort"
+        claimed = self._claim_terminal(transaction_id, operation)
+        if isinstance(claimed, dict):
+            return claimed
+        active = claimed
+        existing_plan = self._load_terminal_plan(transaction_id, operation)
+        if isinstance(existing_plan, dict):
+            return existing_plan
+        if existing_plan is not None:
+            return self._execute_terminal_plan(
+                transaction_id,
+                operation,
+                existing_plan,
             )
+        aborted = self._planned_event(
+            active,
+            "transaction_aborted",
+            {
+                "transaction_id": transaction_id,
+                "reason_hash": hash_bytes(reason.encode("utf-8")),
+            },
+            "aborted",
         )
-        self._clear_active(transaction_id)
-        return {
+        result = {
             "ok": True,
             "status": "local-only",
             "event_ids": [aborted.event_id],
             "queue_status": "pending",
             "counts": {},
         }
+        prepared = self._store_or_load_terminal_plan(
+            active.transaction_id,
+            operation,
+            _TerminalPlan((aborted,), result),
+        )
+        if isinstance(prepared, dict):
+            return prepared
+        return self._execute_terminal_plan(
+            active.transaction_id,
+            operation,
+            prepared,
+        )
 
     def status(self) -> dict[str, object]:
-        corrupt = self.store.verify_chain()
+        try:
+            corrupt = self.store.verify_chain()
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise RecorderStateError("local ledger is corrupt") from exc
         if corrupt:
             return {
                 "ok": False,
@@ -331,13 +455,14 @@ class Recorder:
             "ok": True,
             "status": "local-only",
             "revision": revision,
+            "scope": "lifetime_local_ledger",
             "counts": dict(sorted(counts.items())),
-            "revision_stock": "unavailable",
+            "revision_stock_status": "unavailable",
             "coverage": "unavailable",
         }
 
     def _migrate_active_transactions(self) -> None:
-        connection = sqlite3.connect(self.store.database_path)
+        connection = self._connect()
         try:
             columns = {
                 str(row[1])
@@ -354,6 +479,31 @@ class Recorder:
                     "ALTER TABLE active_transactions "
                     "ADD COLUMN prompt_evidence_json TEXT"
                 )
+            if "terminal_state" not in columns:
+                connection.execute(
+                    "ALTER TABLE active_transactions "
+                    "ADD COLUMN terminal_state TEXT NOT NULL DEFAULT 'active'"
+                )
+            if "terminal_operation" not in columns:
+                connection.execute(
+                    "ALTER TABLE active_transactions "
+                    "ADD COLUMN terminal_operation TEXT"
+                )
+            if "terminal_plan_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE active_transactions "
+                    "ADD COLUMN terminal_plan_json TEXT"
+                )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS completed_transactions (
+                    transaction_id TEXT PRIMARY KEY,
+                    repo_id TEXT NOT NULL,
+                    operation TEXT NOT NULL,
+                    result_json TEXT NOT NULL
+                )
+                """
+            )
             connection.commit()
         except BaseException:
             connection.rollback()
@@ -371,31 +521,130 @@ class Recorder:
             raise InvalidRecorderInput("prompt evidence must be valid JSON") from exc
         if not isinstance(parsed, dict):
             raise InvalidRecorderInput("prompt evidence must be a JSON object")
-        allowed = {
-            "fingerprints",
-            "counts",
-            "normalized_line_count",
-            "normalized_token_count",
-            "line_fingerprints",
-        }
-        return {key: parsed[key] for key in sorted(allowed & parsed.keys())}
+        if set(parsed) != _PROMPT_EVIDENCE_KEYS:
+            raise InvalidRecorderInput(
+                "prompt evidence must contain only the HMAC evidence schema"
+            )
 
-    def _load_active(self, transaction_id: str) -> _ActiveTransaction:
-        connection = sqlite3.connect(self.store.database_path)
+        fingerprints = parsed["fingerprints"]
+        counts = parsed["counts"]
+        line_fingerprints = parsed["line_fingerprints"]
+        normalized_line_count = parsed["normalized_line_count"]
+        normalized_token_count = parsed["normalized_token_count"]
+        if not isinstance(fingerprints, list) or not all(
+            Recorder._is_sha256_hmac(item) for item in fingerprints
+        ):
+            raise InvalidRecorderInput("fingerprints must be SHA-256 HMAC strings")
+        if not isinstance(counts, list) or not all(
+            isinstance(item, int) and not isinstance(item, bool) and item > 0
+            for item in counts
+        ):
+            raise InvalidRecorderInput("counts must be positive integer values")
+        if not isinstance(line_fingerprints, list) or not all(
+            isinstance(block, list)
+            and all(Recorder._is_sha256_hmac(item) for item in block)
+            for block in line_fingerprints
+        ):
+            raise InvalidRecorderInput(
+                "line_fingerprints must be nested SHA-256 HMAC strings"
+            )
+        if not (
+            len(fingerprints) == len(counts) == len(line_fingerprints)
+            and all(
+                count == len(block)
+                for count, block in zip(counts, line_fingerprints, strict=True)
+            )
+        ):
+            raise InvalidRecorderInput("prompt evidence block counts do not match")
+        if (
+            not isinstance(normalized_line_count, int)
+            or isinstance(normalized_line_count, bool)
+            or normalized_line_count < 0
+            or normalized_line_count != sum(counts)
+        ):
+            raise InvalidRecorderInput("normalized line count does not match")
+        if (
+            not isinstance(normalized_token_count, int)
+            or isinstance(normalized_token_count, bool)
+            or normalized_token_count < 0
+        ):
+            raise InvalidRecorderInput(
+                "normalized token count must be a non-negative integer"
+            )
+        return {
+            "counts": counts,
+            "fingerprints": fingerprints,
+            "line_fingerprints": line_fingerprints,
+            "normalized_line_count": normalized_line_count,
+            "normalized_token_count": normalized_token_count,
+        }
+
+    @staticmethod
+    def _is_sha256_hmac(value: object) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value)
+        )
+
+    def _claim_terminal(
+        self,
+        transaction_id: str,
+        operation: str,
+    ) -> _ActiveTransaction | dict[str, object]:
+        connection = self._connect()
         try:
+            connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """
                 SELECT transaction_id, repo_id, session_id, started_at,
-                       snapshot_json, prompt_evidence_json
+                       snapshot_json, prompt_evidence_json,
+                       terminal_state, terminal_operation
                 FROM active_transactions
                 WHERE transaction_id = ? AND repo_id = ?
                 """,
                 (transaction_id, self.repo_id),
             ).fetchone()
+            if row is None:
+                completed = self._completed_result(connection, transaction_id)
+                connection.commit()
+                if completed is not None:
+                    return completed
+                raise InvalidRecorderInput(
+                    "transaction does not exist for this repository"
+                )
+
+            state = str(row[6] or "active")
+            claimed_operation = row[7]
+            if state == "active":
+                connection.execute(
+                    """
+                    UPDATE active_transactions
+                    SET terminal_state = 'claimed', terminal_operation = ?
+                    WHERE transaction_id = ? AND repo_id = ?
+                    """,
+                    (operation, transaction_id, self.repo_id),
+                )
+            elif state != "claimed":
+                raise RecorderStateError("active transaction terminal state is corrupt")
+            elif claimed_operation != operation:
+                connection.commit()
+                return {
+                    "ok": False,
+                    "status": "unavailable",
+                    "error": "TERMINAL_OPERATION_IN_PROGRESS",
+                    "event_ids": [],
+                    "counts": {},
+                }
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
         finally:
             connection.close()
-        if row is None:
-            raise InvalidRecorderInput("transaction does not exist for this repository")
+        return self._active_from_row(row)
+
+    def _active_from_row(self, row: tuple[object, ...]) -> _ActiveTransaction:
         if not isinstance(row[4], str):
             raise RecorderStateError("active transaction has no before snapshot")
         try:
@@ -415,10 +664,151 @@ class Recorder:
             prompt_metadata=prompt_metadata,
         )
 
-    def _clear_active(self, transaction_id: str) -> None:
-        connection = sqlite3.connect(self.store.database_path)
+    def _store_or_load_terminal_plan(
+        self,
+        transaction_id: str,
+        operation: str,
+        proposed: _TerminalPlan,
+    ) -> _TerminalPlan | dict[str, object]:
+        encoded = canonical_json(
+            {
+                "events": [asdict(event) for event in proposed.events],
+                "result": proposed.result,
+            }
+        ).decode("utf-8")
+        connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT terminal_operation, terminal_plan_json
+                FROM active_transactions
+                WHERE transaction_id = ? AND repo_id = ?
+                """,
+                (transaction_id, self.repo_id),
+            ).fetchone()
+            if row is None:
+                completed = self._completed_result(connection, transaction_id)
+                connection.commit()
+                if completed is not None:
+                    return completed
+                raise RecorderStateError("claimed transaction disappeared")
+            if row[0] != operation:
+                connection.commit()
+                return {
+                    "ok": False,
+                    "status": "unavailable",
+                    "error": "TERMINAL_OPERATION_IN_PROGRESS",
+                    "event_ids": [],
+                    "counts": {},
+                }
+            if row[1] is None:
+                connection.execute(
+                    """
+                    UPDATE active_transactions
+                    SET terminal_plan_json = ?
+                    WHERE transaction_id = ? AND repo_id = ?
+                    """,
+                    (encoded, transaction_id, self.repo_id),
+                )
+                selected = proposed
+            elif isinstance(row[1], str):
+                selected = self._decode_terminal_plan(row[1])
+            else:
+                raise RecorderStateError("terminal plan state is corrupt")
+            connection.commit()
+            return selected
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def _load_terminal_plan(
+        self,
+        transaction_id: str,
+        operation: str,
+    ) -> _TerminalPlan | dict[str, object] | None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT terminal_operation, terminal_plan_json
+                FROM active_transactions
+                WHERE transaction_id = ? AND repo_id = ?
+                """,
+                (transaction_id, self.repo_id),
+            ).fetchone()
+            if row is None:
+                completed = self._completed_result(connection, transaction_id)
+                if completed is None:
+                    raise RecorderStateError("claimed transaction disappeared")
+                return completed
+            if row[0] != operation:
+                return {
+                    "ok": False,
+                    "status": "unavailable",
+                    "error": "TERMINAL_OPERATION_IN_PROGRESS",
+                    "event_ids": [],
+                    "counts": {},
+                }
+            if row[1] is None:
+                return None
+            if not isinstance(row[1], str):
+                raise RecorderStateError("terminal plan state is corrupt")
+            return self._decode_terminal_plan(row[1])
+        finally:
+            connection.close()
+
+    def _execute_terminal_plan(
+        self,
+        transaction_id: str,
+        operation: str,
+        plan: _TerminalPlan,
+    ) -> dict[str, object]:
+        for event in plan.events:
+            self._append_and_enqueue(event)
+        return self._complete_terminal(
+            transaction_id,
+            operation,
+            plan.result,
+        )
+
+    def _complete_terminal(
+        self,
+        transaction_id: str,
+        operation: str,
+        result: dict[str, object],
+    ) -> dict[str, object]:
+        encoded_result = canonical_json(result).decode("utf-8")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT terminal_operation
+                FROM active_transactions
+                WHERE transaction_id = ? AND repo_id = ?
+                """,
+                (transaction_id, self.repo_id),
+            ).fetchone()
+            if row is None:
+                completed = self._completed_result(connection, transaction_id)
+                connection.commit()
+                if completed is None:
+                    raise RecorderStateError("terminal transaction disappeared")
+                return completed
+            if row[0] != operation:
+                raise RecorderStateError("terminal operation changed concurrently")
+            connection.execute(
+                """
+                INSERT INTO completed_transactions (
+                    transaction_id, repo_id, operation, result_json
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(transaction_id) DO NOTHING
+                """,
+                (transaction_id, self.repo_id, operation, encoded_result),
+            )
             cursor = connection.execute(
                 "DELETE FROM active_transactions "
                 "WHERE transaction_id = ? AND repo_id = ?",
@@ -427,16 +817,74 @@ class Recorder:
             if cursor.rowcount != 1:
                 raise RecorderStateError("active transaction changed concurrently")
             connection.commit()
+            return result
         except BaseException:
             connection.rollback()
             raise
         finally:
             connection.close()
 
+    def _completed_result(
+        self,
+        connection: sqlite3.Connection,
+        transaction_id: str,
+    ) -> dict[str, object] | None:
+        row = connection.execute(
+            """
+            SELECT result_json
+            FROM completed_transactions
+            WHERE transaction_id = ? AND repo_id = ?
+            """,
+            (transaction_id, self.repo_id),
+        ).fetchone()
+        if row is None:
+            return None
+        if not isinstance(row[0], str):
+            raise RecorderStateError("completed transaction result is corrupt")
+        try:
+            result = json.loads(row[0])
+        except json.JSONDecodeError as exc:
+            raise RecorderStateError("completed transaction result is corrupt") from exc
+        if not isinstance(result, dict):
+            raise RecorderStateError("completed transaction result is corrupt")
+        return result
+
+    @staticmethod
+    def _decode_terminal_plan(encoded: str) -> _TerminalPlan:
+        try:
+            parsed = json.loads(encoded)
+            events = tuple(Event(**event) for event in parsed["events"])
+            result = parsed["result"]
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RecorderStateError("terminal event plan is corrupt") from exc
+        if not isinstance(result, dict):
+            raise RecorderStateError("terminal event plan result is corrupt")
+        return _TerminalPlan(events, result)
+
+    def _planned_event(
+        self,
+        active: _ActiveTransaction,
+        event_type: str,
+        payload: dict[str, object],
+        discriminator: str,
+    ) -> Event:
+        event = Event.new(
+            self.repo_id,
+            active.session_id,
+            event_type,
+            payload,
+        )
+        deterministic_id = uuid5(
+            _EVENT_NAMESPACE,
+            f"{self.repo_id}:{active.transaction_id}:{discriminator}",
+        )
+        return replace(event, event_id=str(deterministic_id))
+
     def _classify(
         self,
         spans: Iterable[PatchSpan],
         before: GitSnapshot,
+        prompt_metadata: dict[str, object],
     ) -> list[PatchSpan]:
         spans_list = list(spans)
         repository_blocks: list[RepositoryBlock] = []
@@ -464,17 +912,53 @@ class Recorder:
         context = ClassificationContext(
             in_transaction=True,
             observer_healthy=True,
-            prompt_evidence=PromptEvidence((), (), b"aigit-empty-evidence", ()),
+            prompt_evidence=self._prompt_evidence(prompt_metadata),
             repository_blocks=tuple(repository_blocks),
             removed_blocks=removed_blocks,
         )
+        classified: list[PatchSpan] = []
+        for span in spans_list:
+            try:
+                classified.extend(classify_spans((span,), context))
+            except Exception:
+                classified.append(
+                    replace(
+                        span,
+                        classification=Classification.UNKNOWN,
+                        confidence=0.0,
+                    )
+                )
+        return classified
+
+    def _prompt_evidence(
+        self,
+        metadata: dict[str, object],
+    ) -> PromptEvidence:
+        if not metadata:
+            return PromptEvidence((), (), self._prompt_hmac_key, ())
         try:
-            return classify_spans(spans_list, context)
-        except Exception:
-            return [
-                replace(span, classification=Classification.UNKNOWN, confidence=0.0)
-                for span in spans_list
-            ]
+            fingerprints = tuple(metadata["fingerprints"])
+            counts = tuple(metadata["counts"])
+            line_fingerprints = tuple(
+                tuple(block) for block in metadata["line_fingerprints"]
+            )
+        except (KeyError, TypeError) as exc:
+            raise RecorderStateError("prompt evidence metadata is corrupt") from exc
+        if not all(isinstance(item, str) for item in fingerprints):
+            raise RecorderStateError("prompt evidence metadata is corrupt")
+        if not all(isinstance(item, int) for item in counts):
+            raise RecorderStateError("prompt evidence metadata is corrupt")
+        if not all(
+            all(isinstance(item, str) for item in block)
+            for block in line_fingerprints
+        ):
+            raise RecorderStateError("prompt evidence metadata is corrupt")
+        return PromptEvidence(
+            fingerprints,
+            counts,
+            self._prompt_hmac_key,
+            line_fingerprints,
+        )
 
     @staticmethod
     def _span_counts(spans: Iterable[PatchSpan]) -> dict[str, int]:
@@ -532,7 +1016,7 @@ class Recorder:
     def _append_and_enqueue(self, event: Event) -> Event:
         appended = self.store.append(event)
         encoded = canonical_json(asdict(appended))
-        connection = sqlite3.connect(self.store.database_path)
+        connection = self._connect()
         try:
             connection.execute(
                 """
@@ -550,7 +1034,7 @@ class Recorder:
         return appended
 
     def _queue_count(self) -> int:
-        connection = sqlite3.connect(self.store.database_path)
+        connection = self._connect()
         try:
             row = connection.execute("SELECT COUNT(*) FROM upload_queue").fetchone()
         finally:

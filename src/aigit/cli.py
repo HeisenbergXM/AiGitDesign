@@ -7,6 +7,7 @@ import json
 import sqlite3
 import subprocess
 import sys
+from pathlib import Path
 from typing import Sequence
 
 from aigit.recorder import InvalidRecorderInput, Recorder, RecorderStateError
@@ -95,10 +96,13 @@ def _emit(payload: dict[str, object]) -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    evidence_path: Path | None = None
     try:
         arguments = _parser().parse_args(argv)
+        if arguments.command == "begin" and arguments.prompt_evidence is not None:
+            evidence_path = Path(arguments.prompt_evidence)
         payload = _dispatch(arguments)
-    except (_ArgumentError, InvalidRecorderInput, subprocess.CalledProcessError) as exc:
+    except (_ArgumentError, InvalidRecorderInput) as exc:
         payload = {
             "ok": False,
             "status": "unavailable",
@@ -106,7 +110,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "message": str(exc),
         }
         exit_code = 2
-    except (RecorderStateError, sqlite3.DatabaseError) as exc:
+    except RecorderStateError as exc:
         payload = {
             "ok": False,
             "status": "unavailable",
@@ -114,7 +118,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             "message": str(exc),
         }
         exit_code = 3
-    except (OSError, UnicodeError, ValueError) as exc:
+    except sqlite3.OperationalError as exc:
+        payload = {
+            "ok": False,
+            "status": "unavailable",
+            "error": "RECORDER_UNAVAILABLE",
+            "message": str(exc),
+        }
+        exit_code = 0
+    except sqlite3.DatabaseError as exc:
+        payload = {
+            "ok": False,
+            "status": "unavailable",
+            "error": "STATE_CORRUPTION",
+            "message": str(exc),
+        }
+        exit_code = 3
+    except (
+        OSError,
+        UnicodeError,
+        ValueError,
+        RuntimeError,
+        subprocess.CalledProcessError,
+    ) as exc:
         payload = {
             "ok": False,
             "status": "unavailable",
@@ -124,6 +150,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         exit_code = 0
     else:
         exit_code = 3 if payload.get("error") == "STATE_CORRUPTION" else 0
+    finally:
+        if evidence_path is not None:
+            try:
+                evidence_path.unlink(missing_ok=True)
+            except OSError:
+                pass
     _emit(payload)
     return exit_code
 

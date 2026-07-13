@@ -32,11 +32,18 @@ def event_hash(event_dict: dict[str, object]) -> str:
 class LocalStore:
     """Durable local ledger whose SQLite state can be rebuilt from JSONL."""
 
-    def __init__(self, state_path: str | Path) -> None:
+    def __init__(
+        self,
+        state_path: str | Path,
+        connection_timeout: float = 30,
+    ) -> None:
+        if connection_timeout <= 0:
+            raise ValueError("connection_timeout must be positive")
         self.state_path = Path(state_path)
         self.blobs_path = self.state_path / "blobs"
         self.ledger_path = self.state_path / "events.jsonl"
         self.database_path = self.state_path / "state.sqlite3"
+        self.connection_timeout = connection_timeout
 
         self.blobs_path.mkdir(parents=True, exist_ok=True)
         self._initialize_database()
@@ -197,7 +204,10 @@ class LocalStore:
         return data
 
     def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.database_path, timeout=30)
+        return sqlite3.connect(
+            self.database_path,
+            timeout=self.connection_timeout,
+        )
 
     def _initialize_database(self) -> None:
         connection = self._connect()
