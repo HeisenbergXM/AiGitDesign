@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import asdict, dataclass, replace
+from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 import json
@@ -72,6 +73,7 @@ class _TerminalClaim:
 
 SQLITE_TIMEOUT_SECONDS = 0.2
 SQLITE_INITIALIZATION_TIMEOUT_SECONDS = 0.001
+TERMINAL_CLAIM_LEASE_SECONDS = 5
 _EVENT_NAMESPACE = UUID("7a207a4d-e4df-49a6-a976-75ef255f33aa")
 _PROMPT_EVIDENCE_KEYS = frozenset(
     {
@@ -667,6 +669,11 @@ class Recorder:
                     "ALTER TABLE active_transactions "
                     "ADD COLUMN terminal_plan_kind TEXT"
                 )
+            if "terminal_claim_expires_at" not in columns:
+                connection.execute(
+                    "ALTER TABLE active_transactions "
+                    "ADD COLUMN terminal_claim_expires_at TEXT"
+                )
             if "started_event_json" not in columns:
                 connection.execute(
                     "ALTER TABLE active_transactions "
@@ -872,7 +879,8 @@ class Recorder:
                 """
                 SELECT transaction_id, repo_id, session_id, started_at,
                        snapshot_json, prompt_evidence_json,
-                       terminal_state, terminal_operation, terminal_plan_kind
+                       terminal_state, terminal_operation, terminal_plan_kind,
+                       terminal_claim_expires_at
                 FROM active_transactions
                 WHERE transaction_id = ? AND repo_id = ?
                 """,
@@ -905,12 +913,14 @@ class Recorder:
                         SET terminal_state = 'claimed',
                             terminal_operation = ?,
                             terminal_plan_json = ?,
-                            terminal_plan_kind = 'fallback'
+                            terminal_plan_kind = 'fallback',
+                            terminal_claim_expires_at = ?
                         WHERE transaction_id = ? AND repo_id = ?
                         """,
                         (
                             operation,
                             self._encode_terminal_plan(fallback),
+                            self._new_terminal_claim_expiry(),
                             transaction_id,
                             self.repo_id,
                         ),
@@ -936,14 +946,27 @@ class Recorder:
                     "counts": {},
                 }
             elif persist_fallback and row[8] == "fallback":
-                connection.commit()
-                return {
-                    "ok": False,
-                    "status": "unavailable",
-                    "error": "TERMINAL_OPERATION_IN_PROGRESS",
-                    "event_ids": [],
-                    "counts": {},
-                }
+                if not self._terminal_claim_lease_expired(row[9]):
+                    connection.commit()
+                    return {
+                        "ok": False,
+                        "status": "unavailable",
+                        "error": "TERMINAL_OPERATION_IN_PROGRESS",
+                        "event_ids": [],
+                        "counts": {},
+                    }
+                connection.execute(
+                    """
+                    UPDATE active_transactions
+                    SET terminal_claim_expires_at = ?
+                    WHERE transaction_id = ? AND repo_id = ?
+                    """,
+                    (
+                        self._new_terminal_claim_expiry(),
+                        transaction_id,
+                        self.repo_id,
+                    ),
+                )
             connection.commit()
         except BaseException:
             connection.rollback()
@@ -951,6 +974,27 @@ class Recorder:
         finally:
             connection.close()
         return _TerminalClaim(active, fresh)
+
+    @staticmethod
+    def _new_terminal_claim_expiry() -> str:
+        return (
+            datetime.now(timezone.utc)
+            + timedelta(seconds=TERMINAL_CLAIM_LEASE_SECONDS)
+        ).isoformat()
+
+    @staticmethod
+    def _terminal_claim_lease_expired(value: object) -> bool:
+        if not isinstance(value, str) or not value:
+            raise RecorderStateError("terminal fallback claim lease is corrupt")
+        try:
+            expires_at = datetime.fromisoformat(value)
+        except ValueError as exc:
+            raise RecorderStateError(
+                "terminal fallback claim lease is corrupt"
+            ) from exc
+        if expires_at.tzinfo is None or expires_at.utcoffset() is None:
+            raise RecorderStateError("terminal fallback claim lease is corrupt")
+        return expires_at <= datetime.now(timezone.utc)
 
     def _active_from_row(self, row: tuple[object, ...]) -> _ActiveTransaction:
         if not isinstance(row[4], str):
@@ -1096,7 +1140,8 @@ class Recorder:
                 connection.execute(
                     """
                     UPDATE active_transactions
-                    SET terminal_plan_json = ?, terminal_plan_kind = ?
+                    SET terminal_plan_json = ?, terminal_plan_kind = ?,
+                        terminal_claim_expires_at = NULL
                     WHERE transaction_id = ? AND repo_id = ?
                     """,
                     (
@@ -1404,47 +1449,35 @@ class Recorder:
         hunks: tuple[_ProposedHunk, ...],
         consumed: set[int],
     ) -> list[PatchSpan]:
-        candidates: dict[tuple[int, int], list[int]] = defaultdict(list)
+        matched: list[tuple[int, int, int]] = []
         for index, hunk in enumerate(hunks):
             if index in consumed:
                 continue
             matched_range = self._added_hunk_range(span, hunk)
             if matched_range is not None:
-                candidates[matched_range].append(index)
-
-        selected: list[tuple[int, int, int]] = []
-        previous_end = -1
-        for (start, end), indexes in sorted(candidates.items()):
-            if len(indexes) != 1 or start < previous_end:
-                continue
-            selected.append((start, end, indexes[0]))
-            previous_end = end
-        if not selected:
+                matched.append((*matched_range, index))
+        if not matched:
             return [self._unknown_classification(span)]
+        consumed.update(index for _, _, index in matched)
+
+        coverage = [0] * len(span.new_lines)
+        for start, end, _ in matched:
+            for position in range(start, end):
+                coverage[position] += 1
 
         result: list[PatchSpan] = []
-        position = 0
-        for start, end, hunk_index in selected:
-            if position < start:
-                result.append(
-                    self._unknown_classification(
-                        self._added_subspan(span, position, start)
-                    )
-                )
-            consumed.add(hunk_index)
-            result.extend(
-                self._classify_one_span(
-                    self._added_subspan(span, start, end),
-                    context,
-                )
-            )
-            position = end
-        if position < len(span.new_lines):
-            result.append(
-                self._unknown_classification(
-                    self._added_subspan(span, position, len(span.new_lines))
-                )
-            )
+        start = 0
+        while start < len(coverage):
+            authorized = coverage[start] == 1
+            end = start + 1
+            while end < len(coverage) and (coverage[end] == 1) == authorized:
+                end += 1
+            subspan = self._added_subspan(span, start, end)
+            if authorized:
+                result.extend(self._classify_one_span(subspan, context))
+            else:
+                result.append(self._unknown_classification(subspan))
+            start = end
         return result
 
     def _added_hunk_range(
@@ -1471,6 +1504,11 @@ class Recorder:
         return start, end
 
     def _hunk_matches_span(self, hunk: _ProposedHunk, span: PatchSpan) -> bool:
+        if hunk.action is ActionKind.MOVED and (
+            hunk.old_end - hunk.old_start != hunk.new_end - hunk.new_start
+            or hunk.old_line_fingerprints != hunk.new_line_fingerprints
+        ):
+            return False
         action_matches = hunk.action is span.action or (
             hunk.action is ActionKind.FORMATTED
             and span.action is ActionKind.REPLACED
@@ -1508,7 +1546,12 @@ class Recorder:
         replacements: dict[int, PatchSpan] = {}
         consumed_span_indexes: set[int] = set()
         for hunk in hunks:
-            if hunk.action is not ActionKind.MOVED:
+            if (
+                hunk.action is not ActionKind.MOVED
+                or hunk.old_end - hunk.old_start
+                != hunk.new_end - hunk.new_start
+                or hunk.old_line_fingerprints != hunk.new_line_fingerprints
+            ):
                 continue
             deleted = [
                 index

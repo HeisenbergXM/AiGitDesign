@@ -98,6 +98,19 @@ def _reject_active_clear(recorder: Recorder) -> None:
         )
 
 
+def _expire_terminal_claim_lease(recorder: Recorder, transaction_id: str) -> None:
+    with sqlite3.connect(recorder.store.database_path) as connection:
+        cursor = connection.execute(
+            """
+            UPDATE active_transactions
+            SET terminal_claim_expires_at = '1970-01-01T00:00:00+00:00'
+            WHERE transaction_id = ?
+            """,
+            (transaction_id,),
+        )
+    assert cursor.rowcount == 1
+
+
 def test_begin_retry_repairs_half_queued_start_and_preserves_session_owner(
     recorder: Recorder,
 ) -> None:
@@ -154,6 +167,133 @@ def test_end_retry_after_queue_failure_does_not_duplicate_contribution(
     assert retried["counts"] == {"AI_SKILL": 1}
     assert len(_event_records(recorder, "patch_applied")) == 1
     assert len(_event_records(recorder, "transaction_finished")) == 1
+
+
+def test_same_end_retry_waits_for_live_fallback_lease_then_takes_over_after_expiry(
+    recorder: Recorder,
+    repository: Path,
+) -> None:
+    transaction_id = str(recorder.begin("session-fallback-crash")["transaction_id"])
+    (repository / "tracked.py").write_text("unobserved_interval = 1\n", encoding="utf-8")
+    operation = "end:passed"
+
+    claimed = recorder._claim_terminal(
+        transaction_id,
+        operation,
+        persist_fallback=True,
+    )
+    assert not isinstance(claimed, dict)
+    with sqlite3.connect(recorder.store.database_path) as connection:
+        stored = connection.execute(
+            """
+            SELECT terminal_plan_json, terminal_plan_kind
+            FROM active_transactions
+            WHERE transaction_id = ?
+            """,
+            (transaction_id,),
+        ).fetchone()
+    assert stored is not None
+    assert stored[1] == "fallback"
+    planned = json.loads(stored[0])
+    planned_event_id = planned["events"][0]["event_id"]
+
+    contended = recorder.end(transaction_id, "passed")
+
+    assert contended["error"] == "TERMINAL_OPERATION_IN_PROGRESS"
+    assert _event_records(recorder, "recovery_detected") == []
+    _expire_terminal_claim_lease(recorder, transaction_id)
+    retried = recorder.end(transaction_id, "passed")
+
+    assert retried["error"] == "CAPTURE_FAILED"
+    assert retried["coverage"] == "UNKNOWN"
+    assert retried["event_ids"] == [planned_event_id]
+    recoveries = _event_records(recorder, "recovery_detected")
+    assert [record["event_id"] for record in recoveries] == [planned_event_id]
+    fresh = recorder.begin("session-after-fallback-crash")
+    assert fresh["ok"] is True
+
+
+@pytest.mark.parametrize("failure_point", ["ledger", "queue"])
+def test_same_end_retry_completes_fallback_after_fallback_write_failure(
+    recorder: Recorder,
+    repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    transaction_id = str(recorder.begin("session-fallback-write")["transaction_id"])
+    (repository / "tracked.py").write_text("failed_interval = 1\n", encoding="utf-8")
+    real_capture = recorder_module.capture_snapshot
+    real_append = recorder.store.append
+
+    def fail_capture(*_args, **_kwargs):
+        raise RuntimeError("injected capture failure")
+
+    def fail_recovery_append(event):
+        if event.event_type == "recovery_detected":
+            raise OSError("injected recovery ledger failure")
+        return real_append(event)
+
+    monkeypatch.setattr(recorder_module, "capture_snapshot", fail_capture)
+    if failure_point == "ledger":
+        monkeypatch.setattr(recorder.store, "append", fail_recovery_append)
+        expected_error: type[BaseException] = OSError
+        expected_message = "injected recovery ledger failure"
+    else:
+        with sqlite3.connect(recorder.store.database_path) as connection:
+            connection.execute(
+                """
+                CREATE TRIGGER reject_recovery_queue_write
+                BEFORE INSERT ON upload_queue
+                WHEN instr(
+                    CAST(NEW.event_json AS TEXT),
+                    '"event_type":"recovery_detected"'
+                ) > 0
+                BEGIN
+                    SELECT RAISE(FAIL, 'injected recovery queue failure');
+                END
+                """
+            )
+        expected_error = sqlite3.DatabaseError
+        expected_message = "injected recovery queue failure"
+
+    with pytest.raises(expected_error, match=expected_message):
+        recorder.end(transaction_id, "failed")
+
+    with sqlite3.connect(recorder.store.database_path) as connection:
+        stored = connection.execute(
+            """
+            SELECT terminal_plan_json, terminal_plan_kind
+            FROM active_transactions
+            WHERE transaction_id = ?
+            """,
+            (transaction_id,),
+        ).fetchone()
+    assert stored is not None
+    assert stored[1] == "fallback"
+    planned = json.loads(stored[0])
+    planned_event_id = planned["events"][0]["event_id"]
+
+    monkeypatch.setattr(recorder.store, "append", real_append)
+    if failure_point == "queue":
+        _drop_trigger(recorder, "reject_recovery_queue_write")
+    monkeypatch.setattr(recorder_module, "capture_snapshot", real_capture)
+    recoveries_before_retry = _event_records(recorder, "recovery_detected")
+    assert len(recoveries_before_retry) == (1 if failure_point == "queue" else 0)
+
+    contended = recorder.end(transaction_id, "failed")
+
+    assert contended["error"] == "TERMINAL_OPERATION_IN_PROGRESS"
+    assert _event_records(recorder, "recovery_detected") == recoveries_before_retry
+    _expire_terminal_claim_lease(recorder, transaction_id)
+    retried = recorder.end(transaction_id, "failed")
+
+    assert retried["error"] == "CAPTURE_FAILED"
+    assert retried["coverage"] == "UNKNOWN"
+    assert retried["event_ids"] == [planned_event_id]
+    recoveries = _event_records(recorder, "recovery_detected")
+    assert [record["event_id"] for record in recoveries] == [planned_event_id]
+    fresh = recorder.begin(f"session-after-{failure_point}-failure")
+    assert fresh["ok"] is True
 
 
 def test_abort_retry_after_queue_failure_has_one_terminal_event(
@@ -326,9 +466,26 @@ def test_racing_end_calls_persist_one_contribution_and_terminal(
     with ThreadPoolExecutor(max_workers=len(racers)) as executor:
         results = list(executor.map(finish, racers))
 
-    assert any(result is not None for result in results)
+    exact = [
+        result
+        for result in results
+        if isinstance(result, dict) and result.get("counts") == {"AI_SKILL": 1}
+    ]
+    assert exact
+    assert all(
+        result is None
+        or (
+            isinstance(result, dict)
+            and (
+                result.get("counts") == {"AI_SKILL": 1}
+                or result.get("error") == "TERMINAL_OPERATION_IN_PROGRESS"
+            )
+        )
+        for result in results
+    )
     assert len(_event_records(recorder, "patch_applied")) == 1
     assert len(_event_records(recorder, "transaction_finished")) == 1
+    assert _event_records(recorder, "recovery_detected") == []
 
 
 def test_racing_abort_calls_persist_one_terminal_event(
@@ -898,6 +1055,68 @@ def test_one_proposed_hunk_is_consumed_globally_at_most_once(
     ]
 
 
+def test_overlapping_added_hunks_authorize_only_uniquely_covered_lines_once(
+    recorder: Recorder,
+) -> None:
+    lines = (
+        "unique_to_first = 1",
+        "ambiguous_overlap = 2",
+        "unique_to_second = 3",
+        "separate_unique_hunk = 4",
+    )
+    span = PatchSpan.added("overlap.py", lines)
+    metadata = _valid_evidence(
+        proposed_hunks=[
+            _proposed_hunk(
+                action="ADDED",
+                path="overlap.py",
+                old_start=0,
+                old_end=0,
+                new_start=0,
+                new_end=2,
+                new_lines=list(lines[0:2]),
+            ),
+            _proposed_hunk(
+                action="ADDED",
+                path="overlap.py",
+                old_start=0,
+                old_end=0,
+                new_start=1,
+                new_end=3,
+                new_lines=list(lines[1:3]),
+            ),
+            _proposed_hunk(
+                action="ADDED",
+                path="overlap.py",
+                old_start=0,
+                old_end=0,
+                new_start=3,
+                new_end=4,
+                new_lines=[lines[3]],
+            ),
+        ]
+    )
+
+    classified = recorder._classify(
+        (span, span),
+        GitSnapshot("", "", "", {}),
+        metadata,
+    )
+
+    observed = [
+        (line, item.classification)
+        for item in classified
+        for line in item.new_lines
+    ]
+    assert observed == [
+        (lines[0], Classification.AI_SKILL),
+        (lines[1], Classification.UNKNOWN),
+        (lines[2], Classification.AI_SKILL),
+        (lines[3], Classification.AI_SKILL),
+        *((line, Classification.UNKNOWN) for line in lines),
+    ]
+
+
 @pytest.mark.parametrize(
     "mutate_hunk",
     [
@@ -1076,6 +1295,70 @@ def test_exact_evidenced_move_records_ai_action_without_inflating_stock(
     ]
     persisted = recorder.store.ledger_path.read_text(encoding="utf-8")
     assert all(line not in persisted for line in moved_lines)
+
+
+@pytest.mark.parametrize(
+    "destination_lines",
+    [
+        pytest.param(
+            ["changed_first = 10", "changed_second = 20"],
+            id="different-content",
+        ),
+        pytest.param(["shorter_destination = 10"], id="different-length"),
+    ],
+)
+def test_non_exact_move_evidence_remains_separate_unknown_changes(
+    recorder: Recorder,
+    repository: Path,
+    destination_lines: list[str],
+) -> None:
+    source_lines = ["source_first = 1", "source_second = 2"]
+    source = repository / "source.py"
+    destination = repository / "destination.py"
+    source.write_text("\n".join(source_lines) + "\n", encoding="utf-8")
+    subprocess.run(["git", "-C", repository, "add", "source.py"], check=True)
+    subprocess.run(
+        ["git", "-C", repository, "commit", "-q", "-m", "non-exact move base"],
+        check=True,
+    )
+    transaction_id = str(
+        _begin_with_evidence(
+            recorder,
+            "session-non-exact-move",
+            proposed_hunks=[
+                _proposed_hunk(
+                    action="MOVED",
+                    path="destination.py",
+                    old_path="source.py",
+                    old_start=0,
+                    old_end=len(source_lines),
+                    new_start=0,
+                    new_end=len(destination_lines),
+                    old_lines=source_lines,
+                    new_lines=destination_lines,
+                )
+            ],
+        )["transaction_id"]
+    )
+    source.unlink()
+    destination.write_text(
+        "\n".join(destination_lines) + "\n",
+        encoding="utf-8",
+    )
+
+    ended = recorder.end(transaction_id, "passed")
+
+    assert ended["counts"] == {"UNKNOWN": len(destination_lines)}
+    spans = [
+        span
+        for record in _event_records(recorder, "patch_applied")
+        for span in record["payload"]["spans"]
+    ]
+    assert {span["action"] for span in spans} == {"ADDED", "DELETED"}
+    assert all(span["classification"] == "UNKNOWN" for span in spans)
+    assert all(span["confidence"] == 0.0 for span in spans)
+    assert all("edit_actor" not in span for span in spans)
+    assert all("old_path_hmac" not in span for span in spans)
 
 
 def _invoke_main(capsys: pytest.CaptureFixture[str], *arguments: str) -> tuple[int, dict[str, object]]:
