@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -12,6 +14,7 @@ import pytest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+EVIDENCE_HMAC_KEY = b"task-5-integration-evidence-key"
 
 
 @pytest.fixture
@@ -40,6 +43,7 @@ def repo(tmp_path: Path) -> Path:
 def cli_env(tmp_path: Path) -> dict[str, str]:
     env = os.environ.copy()
     env["AIGIT_STATE_DIR"] = str(tmp_path / "aigit-state")
+    env["AIGIT_PROMPT_HMAC_KEY"] = EVIDENCE_HMAC_KEY.hex()
     source_root = str(PROJECT_ROOT / "src")
     prior_pythonpath = env.get("PYTHONPATH")
     env["PYTHONPATH"] = (
@@ -67,6 +71,79 @@ def invoke(
     assert not result.stdout[end:].strip(), result.stdout
     assert isinstance(payload, dict)
     return result, payload
+
+
+def _evidence_hmac(value: bytes) -> str:
+    return hmac.new(EVIDENCE_HMAC_KEY, value, hashlib.sha256).hexdigest()
+
+
+def evidence_payload(
+    *,
+    prompt_lines: tuple[str, ...] = (),
+    applied_lines: tuple[str, ...] = (),
+) -> dict[str, object]:
+    def block_fingerprint(lines: tuple[str, ...]) -> str:
+        return _evidence_hmac("\n".join(lines).encode("utf-8"))
+
+    def line_fingerprints(lines: tuple[str, ...]) -> list[str]:
+        return [
+            _evidence_hmac(b"line\0" + line.encode("utf-8"))
+            for line in lines
+        ]
+
+    return {
+        "fingerprints": [block_fingerprint(prompt_lines)] if prompt_lines else [],
+        "counts": [len(prompt_lines)] if prompt_lines else [],
+        "line_fingerprints": (
+            [line_fingerprints(prompt_lines)] if prompt_lines else []
+        ),
+        "normalized_line_count": len(prompt_lines),
+        "normalized_token_count": sum(
+            len(line.split()) for line in prompt_lines
+        ),
+        "applied_patch_fingerprints": (
+            [block_fingerprint(applied_lines)] if applied_lines else []
+        ),
+        "applied_patch_counts": [len(applied_lines)] if applied_lines else [],
+        "applied_patch_line_fingerprints": (
+            [line_fingerprints(applied_lines)] if applied_lines else []
+        ),
+        "applied_patch_normalized_line_count": len(applied_lines),
+        "applied_patch_normalized_token_count": sum(
+            len(line.split()) for line in applied_lines
+        ),
+    }
+
+
+def begin_with_evidence(
+    cli_env: dict[str, str],
+    repo: Path,
+    session: str,
+    *,
+    applied_lines: tuple[str, ...] = (),
+    prompt_lines: tuple[str, ...] = (),
+) -> tuple[subprocess.CompletedProcess[str], dict[str, object]]:
+    evidence = Path(cli_env["AIGIT_STATE_DIR"]).parent / f"{session}-evidence.json"
+    evidence.write_text(
+        json.dumps(
+            evidence_payload(
+                prompt_lines=prompt_lines,
+                applied_lines=applied_lines,
+            )
+        ),
+        encoding="utf-8",
+    )
+    return invoke(
+        cli_env,
+        "begin",
+        "--repo",
+        repo,
+        "--session",
+        session,
+        "--prompt-evidence",
+        evidence,
+        "--json",
+    )
 
 
 def git_status(repo: Path) -> str:
@@ -98,8 +175,11 @@ def test_cli_records_only_net_applied_patch(
 ) -> None:
     (repo / "dirty.py").write_text("manual = 1\n", encoding="utf-8")
 
-    begin_result, begun = invoke(
-        cli_env, "begin", "--repo", repo, "--session", "s-1", "--json"
+    begin_result, begun = begin_with_evidence(
+        cli_env,
+        repo,
+        "s-1",
+        applied_lines=("ai = 2",),
     )
     assert begin_result.returncode == 0
     (repo / "dirty.py").write_text("manual = 1\nai = 2\n", encoding="utf-8")
@@ -133,8 +213,11 @@ def test_second_begin_reports_active_transaction_without_touching_worktree(
     content_before = (repo / "dirty.py").read_bytes()
     status_before = git_status(repo)
 
-    second_result, second = invoke(
-        cli_env, "begin", "--repo", repo, "--session", "s-2", "--json"
+    second_result, second = begin_with_evidence(
+        cli_env,
+        repo,
+        "s-2",
+        applied_lines=("recorded = 2",),
     )
 
     assert second_result.returncode == 0
@@ -169,8 +252,11 @@ def test_abort_clears_transaction_without_recording_its_patch(
     assert abort_result.returncode == 0
     assert aborted["ok"] is True
 
-    second_result, second = invoke(
-        cli_env, "begin", "--repo", repo, "--session", "s-2", "--json"
+    second_result, second = begin_with_evidence(
+        cli_env,
+        repo,
+        "s-2",
+        applied_lines=("recorded = 2",),
     )
     assert second_result.returncode == 0
     (repo / "dirty.py").write_text(
@@ -199,15 +285,7 @@ def test_begin_deletes_valid_prompt_evidence(
 ) -> None:
     evidence = tmp_path / "prompt-evidence.json"
     evidence.write_text(
-        json.dumps(
-            {
-                "fingerprints": [],
-                "counts": [],
-                "line_fingerprints": [],
-                "normalized_line_count": 0,
-                "normalized_token_count": 0,
-            }
-        ),
+        json.dumps(evidence_payload()),
         encoding="utf-8",
     )
 
@@ -260,15 +338,7 @@ def test_begin_deletes_prompt_evidence_when_session_is_empty(
 ) -> None:
     evidence = tmp_path / "prompt-evidence.json"
     evidence.write_text(
-        json.dumps(
-            {
-                "fingerprints": [],
-                "counts": [],
-                "line_fingerprints": [],
-                "normalized_line_count": 0,
-                "normalized_token_count": 0,
-            }
-        ),
+        json.dumps(evidence_payload()),
         encoding="utf-8",
     )
 
@@ -295,15 +365,7 @@ def test_begin_deletes_prompt_evidence_when_recorder_initialization_fails(
 ) -> None:
     evidence = tmp_path / "prompt-evidence.json"
     evidence.write_text(
-        json.dumps(
-            {
-                "fingerprints": [],
-                "counts": [],
-                "line_fingerprints": [],
-                "normalized_line_count": 0,
-                "normalized_token_count": 0,
-            }
-        ),
+        json.dumps(evidence_payload()),
         encoding="utf-8",
     )
     not_a_repository = tmp_path / "not-a-repository"
@@ -323,6 +385,51 @@ def test_begin_deletes_prompt_evidence_when_recorder_initialization_fails(
 
     assert result.returncode == 0
     assert payload["status"] == "unavailable"
+    assert not evidence.exists()
+
+
+@pytest.mark.parametrize(
+    ("option_style", "parser_failure"),
+    [
+        ("separate", "missing-repo"),
+        ("equals", "missing-repo"),
+        ("separate", "extra-argument"),
+        ("equals", "extra-argument"),
+    ],
+)
+def test_parser_level_begin_failure_always_deletes_prompt_evidence(
+    repo: Path,
+    cli_env: dict[str, str],
+    tmp_path: Path,
+    option_style: str,
+    parser_failure: str,
+) -> None:
+    evidence = tmp_path / "parser-evidence.json"
+    evidence.write_text(json.dumps(evidence_payload()), encoding="utf-8")
+    arguments = ["begin"]
+    if parser_failure != "missing-repo":
+        arguments.extend(("--repo", str(repo)))
+    arguments.extend(("--session", "s-1"))
+    if option_style == "separate":
+        arguments.extend(("--prompt-evidence", str(evidence)))
+    else:
+        arguments.append(f"--prompt-evidence={evidence}")
+    if parser_failure == "extra-argument":
+        arguments.append("unexpected-extra-argument")
+    arguments.append("--json")
+
+    result = subprocess.run(
+        [sys.executable, "-m", "aigit.cli", *arguments],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=cli_env,
+        timeout=2,
+    )
+
+    payload = json.loads(result.stdout)
+    assert result.returncode != 0
+    assert payload["error"] == "INVALID_ARGUMENT"
     assert not evidence.exists()
 
 
@@ -375,8 +482,11 @@ def test_report_labels_counts_as_lifetime_ledger_not_revision_stock(
         capture_output=True,
         text=True,
     ).stdout.strip()
-    begin_result, begun = invoke(
-        cli_env, "begin", "--repo", repo, "--session", "s-1", "--json"
+    begin_result, begun = begin_with_evidence(
+        cli_env,
+        repo,
+        "s-1",
+        applied_lines=("generated_after_revision = 1",),
     )
     assert begin_result.returncode == 0
     (repo / "dirty.py").write_text("generated_after_revision = 1\n", encoding="utf-8")
@@ -419,8 +529,11 @@ def test_auxiliary_commands_emit_json_and_linking_preserves_counts(
     assert status_result.returncode == 0
     assert {"ok", "status"} <= status.keys()
 
-    begin_result, begun = invoke(
-        cli_env, "begin", "--repo", repo, "--session", "s-1", "--json"
+    begin_result, begun = begin_with_evidence(
+        cli_env,
+        repo,
+        "s-1",
+        applied_lines=("ai = 1",),
     )
     assert begin_result.returncode == 0
     (repo / "dirty.py").write_text("ai = 1\n", encoding="utf-8")

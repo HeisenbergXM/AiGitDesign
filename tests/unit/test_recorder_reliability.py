@@ -43,7 +43,12 @@ def repository(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def recorder(repository: Path, tmp_path: Path) -> Recorder:
+def recorder(
+    repository: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Recorder:
+    monkeypatch.setenv("AIGIT_PROMPT_HMAC_KEY", PROMPT_HMAC_KEY.hex())
     return Recorder(repository, tmp_path / "state")
 
 
@@ -92,10 +97,50 @@ def _reject_active_clear(recorder: Recorder) -> None:
         )
 
 
+def test_begin_retry_repairs_half_queued_start_and_preserves_session_owner(
+    recorder: Recorder,
+) -> None:
+    _reject_queue_writes(recorder)
+
+    with pytest.raises(sqlite3.DatabaseError, match="injected queue failure"):
+        recorder.begin("session-1")
+
+    started = _event_records(recorder, "transaction_started")
+    assert len(started) == 1
+    transaction_id = str(started[0]["payload"]["transaction_id"])
+    event_id = str(started[0]["event_id"])
+    different_session = recorder.begin("session-2")
+    assert different_session["error"] == "ACTIVE_TRANSACTION"
+
+    _drop_trigger(recorder, "reject_queue_writes")
+    repaired = recorder.begin("session-1")
+
+    assert repaired["transaction_id"] == transaction_id
+    assert repaired["event_ids"] == [event_id]
+    assert len(_event_records(recorder, "transaction_started")) == 1
+    with sqlite3.connect(recorder.store.database_path) as connection:
+        queued = connection.execute(
+            "SELECT COUNT(*) FROM upload_queue WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
+    assert queued == (1,)
+
+    recorder.abort(transaction_id, "cleanup")
+    fresh = recorder.begin("session-2")
+    assert fresh["ok"] is True
+    assert fresh["transaction_id"] != transaction_id
+
+
 def test_end_retry_after_queue_failure_does_not_duplicate_contribution(
     recorder: Recorder, repository: Path
 ) -> None:
-    transaction_id = str(recorder.begin("session-1")["transaction_id"])
+    transaction_id = str(
+        _begin_with_evidence(
+            recorder,
+            "session-1",
+            applied_lines=["generated = 1"],
+        )["transaction_id"]
+    )
     (repository / "tracked.py").write_text("generated = 1\n", encoding="utf-8")
     _reject_queue_writes(recorder)
 
@@ -113,7 +158,13 @@ def test_end_retry_after_queue_failure_does_not_duplicate_contribution(
 def test_abort_retry_after_queue_failure_has_one_terminal_event(
     recorder: Recorder,
 ) -> None:
-    transaction_id = str(recorder.begin("session-1")["transaction_id"])
+    transaction_id = str(
+        _begin_with_evidence(
+            recorder,
+            "session-1",
+            applied_lines=["generated = 1"],
+        )["transaction_id"]
+    )
     _reject_queue_writes(recorder)
 
     with pytest.raises(sqlite3.DatabaseError, match="injected queue failure"):
@@ -130,7 +181,13 @@ def test_abort_retry_after_queue_failure_has_one_terminal_event(
 def test_end_retry_after_clear_failure_reuses_terminal_events(
     recorder: Recorder, repository: Path
 ) -> None:
-    transaction_id = str(recorder.begin("session-1")["transaction_id"])
+    transaction_id = str(
+        _begin_with_evidence(
+            recorder,
+            "session-1",
+            applied_lines=["generated = 1"],
+        )["transaction_id"]
+    )
     (repository / "tracked.py").write_text("generated = 1\n", encoding="utf-8")
     _reject_active_clear(recorder)
 
@@ -153,7 +210,13 @@ def test_end_retry_after_clear_failure_reuses_terminal_events(
 def test_abort_retry_after_clear_failure_reuses_terminal_event(
     recorder: Recorder,
 ) -> None:
-    transaction_id = str(recorder.begin("session-1")["transaction_id"])
+    transaction_id = str(
+        _begin_with_evidence(
+            recorder,
+            "session-1",
+            applied_lines=["generated = 1"],
+        )["transaction_id"]
+    )
     _reject_active_clear(recorder)
 
     with pytest.raises(sqlite3.DatabaseError, match="injected clear failure"):
@@ -170,7 +233,13 @@ def test_abort_retry_after_clear_failure_reuses_terminal_event(
 def test_repeated_end_returns_the_same_deterministic_result(
     recorder: Recorder, repository: Path
 ) -> None:
-    transaction_id = str(recorder.begin("session-1")["transaction_id"])
+    transaction_id = str(
+        _begin_with_evidence(
+            recorder,
+            "session-1",
+            applied_lines=["generated = 1"],
+        )["transaction_id"]
+    )
     (repository / "tracked.py").write_text("generated = 1\n", encoding="utf-8")
 
     first = recorder.end(transaction_id, "passed")
@@ -194,10 +263,54 @@ def test_repeated_abort_returns_the_same_deterministic_result(
     assert len(_event_records(recorder, "transaction_aborted")) == 1
 
 
+def test_abort_after_completed_end_reports_terminal_operation_mismatch(
+    recorder: Recorder,
+    repository: Path,
+) -> None:
+    transaction_id = str(
+        _begin_with_evidence(
+            recorder,
+            "session-1",
+            applied_lines=["generated = 1"],
+        )["transaction_id"]
+    )
+    (repository / "tracked.py").write_text("generated = 1\n", encoding="utf-8")
+    recorder.end(transaction_id, "passed")
+
+    mismatch = recorder.abort(transaction_id, "too late")
+
+    assert mismatch["ok"] is False
+    assert mismatch["status"] == "unavailable"
+    assert mismatch["error"] == "TERMINAL_OPERATION_MISMATCH"
+    assert mismatch["winning_operation"] == "end:passed"
+    assert mismatch.get("counts", {}) == {}
+
+
+def test_end_after_completed_abort_reports_terminal_operation_mismatch(
+    recorder: Recorder,
+) -> None:
+    transaction_id = str(recorder.begin("session-1")["transaction_id"])
+    recorder.abort(transaction_id, "not applied")
+
+    mismatch = recorder.end(transaction_id, "not-run")
+
+    assert mismatch["ok"] is False
+    assert mismatch["status"] == "unavailable"
+    assert mismatch["error"] == "TERMINAL_OPERATION_MISMATCH"
+    assert mismatch["winning_operation"] == "abort"
+    assert mismatch.get("event_ids", []) == []
+
+
 def test_racing_end_calls_persist_one_contribution_and_terminal(
     recorder: Recorder, repository: Path, tmp_path: Path
 ) -> None:
-    transaction_id = str(recorder.begin("session-1")["transaction_id"])
+    transaction_id = str(
+        _begin_with_evidence(
+            recorder,
+            "session-1",
+            applied_lines=["generated = 1"],
+        )["transaction_id"]
+    )
     (repository / "tracked.py").write_text("generated = 1\n", encoding="utf-8")
     racers = [Recorder(repository, tmp_path / "state") for _ in range(6)]
     barrier = threading.Barrier(len(racers))
@@ -242,7 +355,13 @@ def test_racing_abort_calls_persist_one_terminal_event(
 def test_racing_end_and_abort_choose_exactly_one_terminal_outcome(
     recorder: Recorder, repository: Path, tmp_path: Path
 ) -> None:
-    transaction_id = str(recorder.begin("session-1")["transaction_id"])
+    transaction_id = str(
+        _begin_with_evidence(
+            recorder,
+            "session-1",
+            applied_lines=["generated = 1"],
+        )["transaction_id"]
+    )
     (repository / "tracked.py").write_text("generated = 1\n", encoding="utf-8")
     ending = Recorder(repository, tmp_path / "state")
     aborting = Recorder(repository, tmp_path / "state")
@@ -290,14 +409,51 @@ def _block_hmac(lines: list[str]) -> str:
     ).hexdigest()
 
 
-def _valid_evidence(lines: list[str]) -> dict[str, object]:
+def _valid_evidence(
+    prompt_lines: list[str] | None = None,
+    applied_lines: list[str] | None = None,
+) -> dict[str, object]:
+    prompt_lines = prompt_lines or []
+    applied_lines = applied_lines or []
     return {
-        "fingerprints": [_block_hmac(lines)],
-        "counts": [len(lines)],
-        "line_fingerprints": [[_line_hmac(line) for line in lines]],
-        "normalized_line_count": len(lines),
-        "normalized_token_count": sum(len(line.split()) for line in lines),
+        "fingerprints": [_block_hmac(prompt_lines)] if prompt_lines else [],
+        "counts": [len(prompt_lines)] if prompt_lines else [],
+        "line_fingerprints": (
+            [[_line_hmac(line) for line in prompt_lines]] if prompt_lines else []
+        ),
+        "normalized_line_count": len(prompt_lines),
+        "normalized_token_count": sum(
+            len(line.split()) for line in prompt_lines
+        ),
+        "applied_patch_fingerprints": (
+            [_block_hmac(applied_lines)] if applied_lines else []
+        ),
+        "applied_patch_counts": [len(applied_lines)] if applied_lines else [],
+        "applied_patch_line_fingerprints": (
+            [[_line_hmac(line) for line in applied_lines]] if applied_lines else []
+        ),
+        "applied_patch_normalized_line_count": len(applied_lines),
+        "applied_patch_normalized_token_count": sum(
+            len(line.split()) for line in applied_lines
+        ),
     }
+
+
+def _begin_with_evidence(
+    recorder: Recorder,
+    session_id: str,
+    *,
+    applied_lines: list[str] | None = None,
+    prompt_lines: list[str] | None = None,
+) -> dict[str, object]:
+    evidence_path = (
+        recorder.store.state_path.parent / f"{session_id}-prompt-evidence.json"
+    )
+    evidence_path.write_text(
+        json.dumps(_valid_evidence(prompt_lines, applied_lines)),
+        encoding="utf-8",
+    )
+    return recorder.begin(session_id, evidence_path)
 
 
 @pytest.mark.parametrize(
@@ -314,6 +470,36 @@ def _valid_evidence(lines: list[str]) -> dict[str, object]:
         pytest.param(lambda value: {**value, "line_fingerprints": [[]]}, id="line-count-mismatch"),
         pytest.param(lambda value: {**value, "normalized_line_count": 2}, id="total-line-count-mismatch"),
         pytest.param(lambda value: {**value, "normalized_token_count": True}, id="token-count-type"),
+        pytest.param(
+            lambda value: {**value, "applied_patch_fingerprints": "not-a-list"},
+            id="applied-fingerprints-shape",
+        ),
+        pytest.param(
+            lambda value: {**value, "applied_patch_fingerprints": ["f" * 63]},
+            id="applied-fingerprint-sha256",
+        ),
+        pytest.param(
+            lambda value: {**value, "applied_patch_counts": [1]},
+            id="applied-count-cardinality",
+        ),
+        pytest.param(
+            lambda value: {**value, "applied_patch_line_fingerprints": [["xyz"]]},
+            id="applied-line-hmac-sha256",
+        ),
+        pytest.param(
+            lambda value: {
+                **value,
+                "applied_patch_normalized_line_count": 1,
+            },
+            id="applied-total-line-count-mismatch",
+        ),
+        pytest.param(
+            lambda value: {
+                **value,
+                "applied_patch_normalized_token_count": True,
+            },
+            id="applied-token-count-type",
+        ),
         pytest.param(lambda value: {**value, "raw_prompt": "secret source = 41"}, id="unknown-raw-field"),
     ],
 )
@@ -342,7 +528,12 @@ def test_valid_prompt_hmac_evidence_classifies_matching_code_as_user_supplied(
     supplied_line = "user_value = 7"
     evidence_path = tmp_path / "prompt-evidence.json"
     evidence_path.write_text(
-        json.dumps(_valid_evidence([supplied_line])),
+        json.dumps(
+            _valid_evidence(
+                prompt_lines=[supplied_line],
+                applied_lines=[supplied_line],
+            )
+        ),
         encoding="utf-8",
     )
 
@@ -354,6 +545,93 @@ def test_valid_prompt_hmac_evidence_classifies_matching_code_as_user_supplied(
 
     assert ended["counts"] == {"USER_SUPPLIED": 1}
     assert not evidence_path.exists()
+
+
+def test_matching_applied_patch_line_is_classified_as_ai_skill(
+    recorder: Recorder,
+    repository: Path,
+) -> None:
+    transaction_id = str(
+        _begin_with_evidence(
+            recorder,
+            "session-1",
+            applied_lines=["generated = 1"],
+        )["transaction_id"]
+    )
+    (repository / "tracked.py").write_text("generated = 1\n", encoding="utf-8")
+
+    ended = recorder.end(transaction_id, "passed")
+
+    assert ended["counts"] == {"AI_SKILL": 1}
+
+
+def test_applied_repository_copy_can_still_be_classified_as_ai_reused(
+    recorder: Recorder,
+    repository: Path,
+) -> None:
+    copied_lines = ["first = 1", "second = 2", "third = 3"]
+    (repository / "source.py").write_text(
+        "\n".join(copied_lines) + "\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "-C", repository, "add", "source.py"], check=True)
+    subprocess.run(
+        ["git", "-C", repository, "commit", "-q", "-m", "add source"],
+        check=True,
+    )
+    transaction_id = str(
+        _begin_with_evidence(
+            recorder,
+            "session-1",
+            applied_lines=copied_lines,
+        )["transaction_id"]
+    )
+    (repository / "copy.py").write_text(
+        "\n".join(copied_lines) + "\n",
+        encoding="utf-8",
+    )
+
+    ended = recorder.end(transaction_id, "passed")
+
+    assert ended["counts"] == {"AI_REUSED": 3}
+
+
+def test_line_without_applied_patch_evidence_is_unknown(
+    recorder: Recorder,
+    repository: Path,
+) -> None:
+    transaction_id = str(recorder.begin("session-1")["transaction_id"])
+    (repository / "tracked.py").write_text("unmatched = 1\n", encoding="utf-8")
+
+    ended = recorder.end(transaction_id, "passed")
+
+    assert ended["counts"] == {"UNKNOWN": 1}
+
+
+def test_mixed_applied_patch_and_external_line_split_ai_from_unknown(
+    recorder: Recorder,
+    repository: Path,
+) -> None:
+    ai_line = "generated = 1"
+    external_line = "external = 2"
+    transaction_id = str(
+        _begin_with_evidence(
+            recorder,
+            "session-1",
+            applied_lines=[ai_line],
+        )["transaction_id"]
+    )
+    (repository / "tracked.py").write_text(
+        f"{ai_line}\n{external_line}\n",
+        encoding="utf-8",
+    )
+
+    ended = recorder.end(transaction_id, "passed")
+
+    assert ended["counts"] == {"AI_SKILL": 1, "UNKNOWN": 1}
+    persisted = recorder.store.ledger_path.read_text(encoding="utf-8")
+    assert ai_line not in persisted
+    assert external_line not in persisted
 
 
 def _invoke_main(capsys: pytest.CaptureFixture[str], *arguments: str) -> tuple[int, dict[str, object]]:
@@ -372,6 +650,23 @@ def test_sqlite_unavailability_is_one_fail_open_json_object(
 ) -> None:
     def unavailable(_arguments) -> dict[str, object]:
         raise sqlite3.OperationalError(message)
+
+    monkeypatch.setattr(cli_module, "_dispatch", unavailable)
+
+    exit_code, payload = _invoke_main(capsys, "status", "--repo", ".", "--json")
+
+    assert exit_code == 0
+    assert payload["ok"] is False
+    assert payload["status"] == "unavailable"
+    assert payload["error"] == "RECORDER_UNAVAILABLE"
+
+
+def test_plain_sqlite_database_error_is_fail_open_unavailable(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unavailable(_arguments) -> dict[str, object]:
+        raise sqlite3.DatabaseError("generic SQLite storage failure")
 
     monkeypatch.setattr(cli_module, "_dispatch", unavailable)
 
@@ -402,6 +697,59 @@ def test_genuine_state_corruption_remains_nonzero(
 
     assert exit_code != 0
     assert payload["error"] == "STATE_CORRUPTION"
+
+
+def test_demonstrated_ledger_chain_corruption_remains_nonzero(
+    repository: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_root = tmp_path / "state"
+    monkeypatch.setenv("AIGIT_STATE_DIR", str(state_root))
+    recorder = Recorder(repository, state_root)
+    transaction_id = str(recorder.begin("session-1")["transaction_id"])
+    recorder.abort(transaction_id, "not applied")
+    records = _records(recorder)
+    records[0]["payload"] = {"tampered": True}
+    recorder.store.ledger_path.write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n",
+        encoding="utf-8",
+    )
+
+    exit_code, payload = _invoke_main(
+        capsys,
+        "status",
+        "--repo",
+        str(repository),
+        "--json",
+    )
+
+    assert exit_code != 0
+    assert payload["error"] == "STATE_CORRUPTION"
+
+
+def test_short_environment_hmac_key_is_fail_open_unavailable(
+    repository: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AIGIT_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("AIGIT_PROMPT_HMAC_KEY", b"short".hex())
+
+    exit_code, payload = _invoke_main(
+        capsys,
+        "status",
+        "--repo",
+        str(repository),
+        "--json",
+    )
+
+    assert exit_code == 0
+    assert payload["ok"] is False
+    assert payload["status"] == "unavailable"
+    assert payload["error"] == "RECORDER_UNAVAILABLE"
 
 
 def test_git_capture_failure_is_fail_open_and_persists_no_ai_claim(
@@ -468,6 +816,74 @@ def test_git_diff_failure_is_fail_open_and_persists_no_ai_claim(
     assert _event_records(recorder, "patch_applied") == []
 
 
+@pytest.mark.parametrize(
+    ("failure_point", "error_code"),
+    [("capture", "CAPTURE_FAILED"), ("diff", "DIFF_FAILED")],
+)
+def test_terminal_capture_or_diff_failure_closes_unknown_coverage_gap(
+    recorder: Recorder,
+    repository: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+    error_code: str,
+) -> None:
+    failed_line = "failed_interval = 1"
+    later_line = "later_generated = 2"
+    transaction_id = str(
+        _begin_with_evidence(
+            recorder,
+            "session-1",
+            applied_lines=[failed_line],
+        )["transaction_id"]
+    )
+    (repository / "tracked.py").write_text(failed_line + "\n", encoding="utf-8")
+    real_capture = recorder_module.capture_snapshot
+    real_diff = recorder_module.diff_snapshots
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError(f"injected {failure_point} failure")
+
+    monkeypatch.setattr(
+        recorder_module,
+        "capture_snapshot" if failure_point == "capture" else "diff_snapshots",
+        fail,
+    )
+
+    degraded = recorder.end(transaction_id, "failed")
+
+    monkeypatch.setattr(recorder_module, "capture_snapshot", real_capture)
+    monkeypatch.setattr(recorder_module, "diff_snapshots", real_diff)
+    repeated = recorder.end(transaction_id, "failed")
+    assert repeated == degraded
+    assert degraded["status"] == "unavailable"
+    assert degraded["error"] == error_code
+    assert degraded["coverage"] == "UNKNOWN"
+    recoveries = _event_records(recorder, "recovery_detected")
+    assert len(recoveries) == 1
+    assert recoveries[0]["event_id"] in degraded["event_ids"]
+    assert recoveries[0]["payload"] == {
+        "classification": "UNKNOWN",
+        "reason_code": error_code,
+        "transaction_id": transaction_id,
+    }
+    assert _event_records(recorder, "patch_applied") == []
+    assert _event_records(recorder, "transaction_finished") == []
+
+    next_transaction = str(
+        _begin_with_evidence(
+            recorder,
+            "session-2",
+            applied_lines=[later_line],
+        )["transaction_id"]
+    )
+    (repository / "tracked.py").write_text(
+        f"{failed_line}\n{later_line}\n",
+        encoding="utf-8",
+    )
+    later = recorder.end(next_transaction, "passed")
+    assert later["counts"] == {"AI_SKILL": 1}
+
+
 def test_classifier_failure_downgrades_only_the_affected_span(
     recorder: Recorder,
     repository: Path,
@@ -475,7 +891,13 @@ def test_classifier_failure_downgrades_only_the_affected_span(
 ) -> None:
     (repository / "good.py").write_text("", encoding="utf-8")
     (repository / "bad.py").write_text("", encoding="utf-8")
-    transaction_id = str(recorder.begin("session-1")["transaction_id"])
+    transaction_id = str(
+        _begin_with_evidence(
+            recorder,
+            "session-1",
+            applied_lines=["good = 1", "bad = 1"],
+        )["transaction_id"]
+    )
     (repository / "good.py").write_text("good = 1\n", encoding="utf-8")
     (repository / "bad.py").write_text("bad = 1\n", encoding="utf-8")
     real_classify = recorder_module.classify_spans

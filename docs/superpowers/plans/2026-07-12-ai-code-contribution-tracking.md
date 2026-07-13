@@ -10,6 +10,9 @@
 
 ## Global Constraints
 
+- The generation skill automatically creates HMAC-only fingerprints for both complete prompt-supplied code and the exact proposed patch before `begin`, passes them through the existing `--prompt-evidence` file, and applies exactly that evidenced patch. This requires no developer action and no Git, CI/CD, hosting, gateway, or model-platform cooperation.
+- A transaction boundary alone is not AI attribution evidence. Only diff lines matching automatic applied-patch evidence continue through prompt/reuse/AI classification; unmatched or missing applied evidence is `UNKNOWN`. Pure added mixed spans split losslessly, while inseparable partial replacements remain wholly `UNKNOWN`.
+
 - 只实施 README 第 1 档和第 2 档；不建设模型网关，不截取 token，不要求模型部门、Git 平台或 CI/CD 配合。
 - 不要求开发者加标签、写特殊提交信息、填表、确认归因或手工补传。
 - 只把一次 AI transaction 内实际应用的净 patch 计入 AI；调用前 staged、unstaged 和 untracked 内容必须排除。
@@ -350,6 +353,8 @@ git commit -m "feat: classify ai reuse moves and supplied code"
 - Consumes: snapshot, store and classifier APIs from Tasks 2-4.
 - Produces: `Recorder.begin`, `Recorder.end`, `Recorder.abort`, and the exact CLI in `skills/tracking-ai-code-contributions/references/recorder-contract.md`.
 
+**Approved evidence constraint:** Before `begin`, the generation skill produces the exact patch in memory and automatically writes strict HMAC-only prompt and applied-patch evidence to the existing temporary evidence file. The recorder gates transaction attribution with applied-patch evidence: matching lines retain prompt-first/reuse/AI precedence, unmatched or missing evidence is `UNKNOWN`, pure added mixed spans split, and inseparable partial replacements are wholly `UNKNOWN`. The skill requires no developer labels, Git/CI changes, or model-platform support.
+
 - [ ] **Step 1: Write a transaction boundary test**
 
 ```python
@@ -385,9 +390,9 @@ Expected: FAIL because `aigit.cli` is absent.
 
 - [ ] **Step 3: Implement begin/end/abort**
 
-`begin` acquires a per-repo lock for at most 250 ms, captures the before snapshot, creates `transaction_started`, persists the active transaction, deletes the prompt evidence file in `finally`, and returns immediately. A second active transaction for the same repo returns JSON error `ACTIVE_TRANSACTION` without touching Git.
+`begin` acquires a per-repo lock for at most 250 ms, captures the before snapshot, creates a deterministic `transaction_started` plan/result, persists the active transaction, deletes the prompt evidence file in `finally`, and returns immediately. A same-session retry after append/queue half-failure repairs and returns that same transaction/event; a different session returns JSON error `ACTIVE_TRANSACTION` without touching Git.
 
-`end` captures after snapshot, computes only snapshot delta, classifies spans, appends one `patch_applied` event per file plus `transaction_finished`, enqueues them, deletes the active transaction and returns counts. If capture or classification cannot isolate a span, append `UNKNOWN` rather than absorbing all current diff.
+`end` repairs any pending start event, captures after snapshot, computes only snapshot delta, gates spans by automatic applied-patch evidence, appends one `patch_applied` event per file plus `transaction_finished`, enqueues them, deletes the active transaction and returns counts. If capture or diff fails, durably complete with deterministic `recovery_detected`/`UNKNOWN` coverage-gap evidence so retries or later edits cannot be absorbed. If classification cannot isolate a span, append `UNKNOWN` rather than absorbing all current diff.
 
 `abort` appends `transaction_aborted` and clears the transaction without contribution. All commands print one JSON object and use exit code 0 for recorded/local-only/unavailable fail-open states; use non-zero only for invalid arguments or state corruption.
 

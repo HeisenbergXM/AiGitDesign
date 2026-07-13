@@ -19,7 +19,7 @@ from aigit.classifier import (
     RepositoryBlock,
     classify_spans,
 )
-from aigit.domain import Classification, Event, GitSnapshot, PatchSpan
+from aigit.domain import ActionKind, Classification, Event, GitSnapshot, PatchSpan
 from aigit.git_state import capture_snapshot, diff_snapshots, find_repo, repo_id
 from aigit.local_store import LocalStore
 from aigit.prompt_evidence import PromptEvidence
@@ -59,6 +59,11 @@ _PROMPT_EVIDENCE_KEYS = frozenset(
         "normalized_line_count",
         "normalized_token_count",
         "line_fingerprints",
+        "applied_patch_fingerprints",
+        "applied_patch_counts",
+        "applied_patch_normalized_line_count",
+        "applied_patch_normalized_token_count",
+        "applied_patch_line_fingerprints",
     }
 )
 
@@ -100,8 +105,10 @@ class Recorder:
                 raise ValueError(
                     "AIGIT_PROMPT_HMAC_KEY must be hexadecimal"
                 ) from exc
-            if not key:
-                raise ValueError("AIGIT_PROMPT_HMAC_KEY must not be empty")
+            if len(key) < 16:
+                raise ValueError(
+                    "AIGIT_PROMPT_HMAC_KEY must contain at least 16 bytes"
+                )
             return key
 
         key_path = self.store.state_path / "prompt-hmac.key"
@@ -141,6 +148,8 @@ class Recorder:
             if not session_id.strip():
                 raise InvalidRecorderInput("session must not be empty")
             prompt_metadata = self._read_prompt_metadata(evidence_path)
+            repair_event: Event | None = None
+            repair_result: dict[str, object] | None = None
             connection = self._connect()
             try:
                 try:
@@ -155,50 +164,93 @@ class Recorder:
                     raise
 
                 existing = connection.execute(
-                    "SELECT transaction_id FROM active_transactions WHERE repo_id = ?",
+                    """
+                    SELECT transaction_id, session_id,
+                           started_event_json, begin_result_json
+                    FROM active_transactions
+                    WHERE repo_id = ?
+                    """,
                     (self.repo_id,),
                 ).fetchone()
                 if existing is not None:
-                    connection.rollback()
-                    return {
-                        "ok": False,
-                        "status": "unavailable",
-                        "error": "ACTIVE_TRANSACTION",
-                    }
-
-                snapshot = capture_snapshot(self.repository, self.store)
-                transaction_id = str(uuid4())
-                started = Event.new(
-                    self.repo_id,
-                    session_id,
-                    "transaction_started",
-                    {
-                        "transaction_id": transaction_id,
-                        "head_before": snapshot.head,
-                        "dirty_diff_hash_before": snapshot.worktree_hash,
-                        "prompt_evidence": prompt_metadata,
-                    },
-                )
-                connection.execute(
-                    """
-                    INSERT INTO active_transactions (
-                        transaction_id,
-                        repo_id,
-                        session_id,
-                        started_at,
-                        snapshot_json,
-                        prompt_evidence_json
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        transaction_id,
+                    if str(existing[1]) != session_id:
+                        connection.rollback()
+                        return {
+                            "ok": False,
+                            "status": "unavailable",
+                            "error": "ACTIVE_TRANSACTION",
+                        }
+                    if not isinstance(existing[2], str) or not isinstance(
+                        existing[3], str
+                    ):
+                        connection.rollback()
+                        return {
+                            "ok": False,
+                            "status": "unavailable",
+                            "error": "ACTIVE_TRANSACTION",
+                        }
+                    repair_event = self._decode_event(
+                        existing[2],
+                        "transaction start event is corrupt",
+                    )
+                    repair_result = self._decode_result(
+                        existing[3],
+                        "transaction begin result is corrupt",
+                    )
+                else:
+                    snapshot = capture_snapshot(self.repository, self.store)
+                    transaction_id = str(uuid4())
+                    started = Event.new(
                         self.repo_id,
                         session_id,
-                        started.observed_at,
-                        canonical_json(asdict(snapshot)).decode("utf-8"),
-                        canonical_json(prompt_metadata).decode("utf-8"),
-                    ),
-                )
+                        "transaction_started",
+                        {
+                            "transaction_id": transaction_id,
+                            "head_before": snapshot.head,
+                            "dirty_diff_hash_before": snapshot.worktree_hash,
+                            "prompt_evidence": prompt_metadata,
+                        },
+                    )
+                    started = replace(
+                        started,
+                        event_id=str(
+                            uuid5(
+                                _EVENT_NAMESPACE,
+                                f"{self.repo_id}:{transaction_id}:started",
+                            )
+                        ),
+                    )
+                    result = {
+                        "ok": True,
+                        "status": "local-only",
+                        "transaction_id": transaction_id,
+                        "event_ids": [started.event_id],
+                        "queue_status": "pending",
+                    }
+                    connection.execute(
+                        """
+                        INSERT INTO active_transactions (
+                            transaction_id,
+                            repo_id,
+                            session_id,
+                            started_at,
+                            snapshot_json,
+                            prompt_evidence_json,
+                            started_event_json,
+                            begin_result_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            transaction_id,
+                            self.repo_id,
+                            session_id,
+                            started.observed_at,
+                            canonical_json(asdict(snapshot)).decode("utf-8"),
+                            canonical_json(prompt_metadata).decode("utf-8"),
+                            canonical_json(asdict(started)).decode("utf-8"),
+                            canonical_json(result).decode("utf-8"),
+                        ),
+                    )
                 connection.commit()
             except BaseException:
                 connection.rollback()
@@ -206,14 +258,11 @@ class Recorder:
             finally:
                 connection.close()
 
-            appended = self._append_and_enqueue(started)
-            return {
-                "ok": True,
-                "status": "local-only",
-                "transaction_id": transaction_id,
-                "event_ids": [appended.event_id],
-                "queue_status": "pending",
-            }
+            if repair_event is not None and repair_result is not None:
+                self._append_and_enqueue(repair_event)
+                return repair_result
+            self._append_and_enqueue(started)
+            return result
         finally:
             if evidence_path is not None:
                 try:
@@ -231,6 +280,7 @@ class Recorder:
         if isinstance(claimed, dict):
             return claimed
         active = claimed
+        self._repair_started_event(transaction_id)
         existing_plan = self._load_terminal_plan(transaction_id, operation)
         if isinstance(existing_plan, dict):
             return existing_plan
@@ -240,8 +290,22 @@ class Recorder:
                 operation,
                 existing_plan,
             )
-        after = capture_snapshot(self.repository, self.store)
-        raw_spans = diff_snapshots(active.snapshot, after, self.store)
+        try:
+            after = capture_snapshot(self.repository, self.store)
+        except Exception:
+            return self._degrade_terminal(
+                active,
+                operation,
+                "CAPTURE_FAILED",
+            )
+        try:
+            raw_spans = diff_snapshots(active.snapshot, after, self.store)
+        except Exception:
+            return self._degrade_terminal(
+                active,
+                operation,
+                "DIFF_FAILED",
+            )
         classified = self._classify(
             raw_spans,
             active.snapshot,
@@ -317,6 +381,7 @@ class Recorder:
         if isinstance(claimed, dict):
             return claimed
         active = claimed
+        self._repair_started_event(transaction_id)
         existing_plan = self._load_terminal_plan(transaction_id, operation)
         if isinstance(existing_plan, dict):
             return existing_plan
@@ -346,6 +411,44 @@ class Recorder:
             active.transaction_id,
             operation,
             _TerminalPlan((aborted,), result),
+        )
+        if isinstance(prepared, dict):
+            return prepared
+        return self._execute_terminal_plan(
+            active.transaction_id,
+            operation,
+            prepared,
+        )
+
+    def _degrade_terminal(
+        self,
+        active: _ActiveTransaction,
+        operation: str,
+        reason_code: str,
+    ) -> dict[str, object]:
+        recovery = self._planned_event(
+            active,
+            "recovery_detected",
+            {
+                "classification": Classification.UNKNOWN.value,
+                "reason_code": reason_code,
+                "transaction_id": active.transaction_id,
+            },
+            f"recovery:{reason_code}",
+        )
+        result = {
+            "ok": False,
+            "status": "unavailable",
+            "error": reason_code,
+            "coverage": Classification.UNKNOWN.value,
+            "event_ids": [recovery.event_id],
+            "queue_status": "pending",
+            "counts": {},
+        }
+        prepared = self._store_or_load_terminal_plan(
+            active.transaction_id,
+            operation,
+            _TerminalPlan((recovery,), result),
         )
         if isinstance(prepared, dict):
             return prepared
@@ -494,6 +597,16 @@ class Recorder:
                     "ALTER TABLE active_transactions "
                     "ADD COLUMN terminal_plan_json TEXT"
                 )
+            if "started_event_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE active_transactions "
+                    "ADD COLUMN started_event_json TEXT"
+                )
+            if "begin_result_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE active_transactions "
+                    "ADD COLUMN begin_result_json TEXT"
+                )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS completed_transactions (
@@ -531,6 +644,15 @@ class Recorder:
         line_fingerprints = parsed["line_fingerprints"]
         normalized_line_count = parsed["normalized_line_count"]
         normalized_token_count = parsed["normalized_token_count"]
+        applied_fingerprints = parsed["applied_patch_fingerprints"]
+        applied_counts = parsed["applied_patch_counts"]
+        applied_line_fingerprints = parsed["applied_patch_line_fingerprints"]
+        applied_normalized_line_count = parsed[
+            "applied_patch_normalized_line_count"
+        ]
+        applied_normalized_token_count = parsed[
+            "applied_patch_normalized_token_count"
+        ]
         if not isinstance(fingerprints, list) or not all(
             Recorder._is_sha256_hmac(item) for item in fingerprints
         ):
@@ -571,7 +693,68 @@ class Recorder:
             raise InvalidRecorderInput(
                 "normalized token count must be a non-negative integer"
             )
+        if not isinstance(applied_fingerprints, list) or not all(
+            Recorder._is_sha256_hmac(item) for item in applied_fingerprints
+        ):
+            raise InvalidRecorderInput(
+                "applied patch fingerprints must be SHA-256 HMAC strings"
+            )
+        if not isinstance(applied_counts, list) or not all(
+            isinstance(item, int) and not isinstance(item, bool) and item > 0
+            for item in applied_counts
+        ):
+            raise InvalidRecorderInput(
+                "applied patch counts must be positive integer values"
+            )
+        if not isinstance(applied_line_fingerprints, list) or not all(
+            isinstance(block, list)
+            and all(Recorder._is_sha256_hmac(item) for item in block)
+            for block in applied_line_fingerprints
+        ):
+            raise InvalidRecorderInput(
+                "applied patch line fingerprints must be nested SHA-256 HMAC strings"
+            )
+        if not (
+            len(applied_fingerprints)
+            == len(applied_counts)
+            == len(applied_line_fingerprints)
+            and all(
+                count == len(block)
+                for count, block in zip(
+                    applied_counts,
+                    applied_line_fingerprints,
+                    strict=True,
+                )
+            )
+        ):
+            raise InvalidRecorderInput(
+                "applied patch evidence block counts do not match"
+            )
+        if (
+            not isinstance(applied_normalized_line_count, int)
+            or isinstance(applied_normalized_line_count, bool)
+            or applied_normalized_line_count < 0
+            or applied_normalized_line_count != sum(applied_counts)
+        ):
+            raise InvalidRecorderInput(
+                "applied patch normalized line count does not match"
+            )
+        if (
+            not isinstance(applied_normalized_token_count, int)
+            or isinstance(applied_normalized_token_count, bool)
+            or applied_normalized_token_count < 0
+        ):
+            raise InvalidRecorderInput(
+                "applied patch normalized token count must be a non-negative integer"
+            )
         return {
+            "applied_patch_counts": applied_counts,
+            "applied_patch_fingerprints": applied_fingerprints,
+            "applied_patch_line_fingerprints": applied_line_fingerprints,
+            "applied_patch_normalized_line_count": applied_normalized_line_count,
+            "applied_patch_normalized_token_count": (
+                applied_normalized_token_count
+            ),
             "counts": counts,
             "fingerprints": fingerprints,
             "line_fingerprints": line_fingerprints,
@@ -606,7 +789,11 @@ class Recorder:
                 (transaction_id, self.repo_id),
             ).fetchone()
             if row is None:
-                completed = self._completed_result(connection, transaction_id)
+                completed = self._completed_result(
+                    connection,
+                    transaction_id,
+                    operation,
+                )
                 connection.commit()
                 if completed is not None:
                     return completed
@@ -664,6 +851,29 @@ class Recorder:
             prompt_metadata=prompt_metadata,
         )
 
+    def _repair_started_event(self, transaction_id: str) -> None:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT started_event_json
+                FROM active_transactions
+                WHERE transaction_id = ? AND repo_id = ?
+                """,
+                (transaction_id, self.repo_id),
+            ).fetchone()
+        finally:
+            connection.close()
+        if row is None:
+            return
+        if row[0] is None:
+            return
+        if not isinstance(row[0], str):
+            raise RecorderStateError("transaction start event is corrupt")
+        self._append_and_enqueue(
+            self._decode_event(row[0], "transaction start event is corrupt")
+        )
+
     def _store_or_load_terminal_plan(
         self,
         transaction_id: str,
@@ -688,7 +898,11 @@ class Recorder:
                 (transaction_id, self.repo_id),
             ).fetchone()
             if row is None:
-                completed = self._completed_result(connection, transaction_id)
+                completed = self._completed_result(
+                    connection,
+                    transaction_id,
+                    operation,
+                )
                 connection.commit()
                 if completed is not None:
                     return completed
@@ -740,7 +954,11 @@ class Recorder:
                 (transaction_id, self.repo_id),
             ).fetchone()
             if row is None:
-                completed = self._completed_result(connection, transaction_id)
+                completed = self._completed_result(
+                    connection,
+                    transaction_id,
+                    operation,
+                )
                 if completed is None:
                     raise RecorderStateError("claimed transaction disappeared")
                 return completed
@@ -793,7 +1011,11 @@ class Recorder:
                 (transaction_id, self.repo_id),
             ).fetchone()
             if row is None:
-                completed = self._completed_result(connection, transaction_id)
+                completed = self._completed_result(
+                    connection,
+                    transaction_id,
+                    operation,
+                )
                 connection.commit()
                 if completed is None:
                     raise RecorderStateError("terminal transaction disappeared")
@@ -828,10 +1050,11 @@ class Recorder:
         self,
         connection: sqlite3.Connection,
         transaction_id: str,
+        requested_operation: str,
     ) -> dict[str, object] | None:
         row = connection.execute(
             """
-            SELECT result_json
+            SELECT operation, result_json
             FROM completed_transactions
             WHERE transaction_id = ? AND repo_id = ?
             """,
@@ -839,10 +1062,17 @@ class Recorder:
         ).fetchone()
         if row is None:
             return None
-        if not isinstance(row[0], str):
+        if not isinstance(row[0], str) or not isinstance(row[1], str):
             raise RecorderStateError("completed transaction result is corrupt")
+        if row[0] != requested_operation:
+            return {
+                "ok": False,
+                "status": "unavailable",
+                "error": "TERMINAL_OPERATION_MISMATCH",
+                "winning_operation": row[0],
+            }
         try:
-            result = json.loads(row[0])
+            result = json.loads(row[1])
         except json.JSONDecodeError as exc:
             raise RecorderStateError("completed transaction result is corrupt") from exc
         if not isinstance(result, dict):
@@ -860,6 +1090,24 @@ class Recorder:
         if not isinstance(result, dict):
             raise RecorderStateError("terminal event plan result is corrupt")
         return _TerminalPlan(events, result)
+
+    @staticmethod
+    def _decode_event(encoded: str, message: str) -> Event:
+        try:
+            parsed = json.loads(encoded)
+            return Event(**parsed)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RecorderStateError(message) from exc
+
+    @staticmethod
+    def _decode_result(encoded: str, message: str) -> dict[str, object]:
+        try:
+            parsed = json.loads(encoded)
+        except json.JSONDecodeError as exc:
+            raise RecorderStateError(message) from exc
+        if not isinstance(parsed, dict):
+            raise RecorderStateError(message)
+        return parsed
 
     def _planned_event(
         self,
@@ -916,19 +1164,66 @@ class Recorder:
             repository_blocks=tuple(repository_blocks),
             removed_blocks=removed_blocks,
         )
+        applied_evidence = self._applied_patch_evidence(prompt_metadata)
         classified: list[PatchSpan] = []
         for span in spans_list:
-            try:
-                classified.extend(classify_spans((span,), context))
-            except Exception:
+            ranges = applied_evidence.matching_ranges(span.new_lines)
+            if ranges == ((0, len(span.new_lines)),):
+                classified.extend(self._classify_one_span(span, context))
+                continue
+            if not ranges or span.action is not ActionKind.ADDED:
+                classified.append(self._unknown_classification(span))
+                continue
+
+            position = 0
+            for start, end in ranges:
+                if position < start:
+                    classified.append(
+                        self._unknown_classification(
+                            self._added_subspan(span, position, start)
+                        )
+                    )
+                classified.extend(
+                    self._classify_one_span(
+                        self._added_subspan(span, start, end),
+                        context,
+                    )
+                )
+                position = end
+            if position < len(span.new_lines):
                 classified.append(
-                    replace(
-                        span,
-                        classification=Classification.UNKNOWN,
-                        confidence=0.0,
+                    self._unknown_classification(
+                        self._added_subspan(span, position, len(span.new_lines))
                     )
                 )
         return classified
+
+    @staticmethod
+    def _classify_one_span(
+        span: PatchSpan,
+        context: ClassificationContext,
+    ) -> list[PatchSpan]:
+        try:
+            return classify_spans((span,), context)
+        except Exception:
+            return [Recorder._unknown_classification(span)]
+
+    @staticmethod
+    def _unknown_classification(span: PatchSpan) -> PatchSpan:
+        return replace(
+            span,
+            classification=Classification.UNKNOWN,
+            confidence=0.0,
+        )
+
+    @staticmethod
+    def _added_subspan(span: PatchSpan, start: int, end: int) -> PatchSpan:
+        return replace(
+            span,
+            new_start=span.new_start + start,
+            new_end=span.new_start + end,
+            new_lines=span.new_lines[start:end],
+        )
 
     def _prompt_evidence(
         self,
@@ -953,6 +1248,39 @@ class Recorder:
             for block in line_fingerprints
         ):
             raise RecorderStateError("prompt evidence metadata is corrupt")
+        return PromptEvidence(
+            fingerprints,
+            counts,
+            self._prompt_hmac_key,
+            line_fingerprints,
+        )
+
+    def _applied_patch_evidence(
+        self,
+        metadata: dict[str, object],
+    ) -> PromptEvidence:
+        if not metadata:
+            return PromptEvidence((), (), self._prompt_hmac_key, ())
+        try:
+            fingerprints = tuple(metadata["applied_patch_fingerprints"])
+            counts = tuple(metadata["applied_patch_counts"])
+            line_fingerprints = tuple(
+                tuple(block)
+                for block in metadata["applied_patch_line_fingerprints"]
+            )
+        except (KeyError, TypeError) as exc:
+            raise RecorderStateError(
+                "applied patch evidence metadata is corrupt"
+            ) from exc
+        if not all(isinstance(item, str) for item in fingerprints):
+            raise RecorderStateError("applied patch evidence metadata is corrupt")
+        if not all(isinstance(item, int) for item in counts):
+            raise RecorderStateError("applied patch evidence metadata is corrupt")
+        if not all(
+            all(isinstance(item, str) for item in block)
+            for block in line_fingerprints
+        ):
+            raise RecorderStateError("applied patch evidence metadata is corrupt")
         return PromptEvidence(
             fingerprints,
             counts,

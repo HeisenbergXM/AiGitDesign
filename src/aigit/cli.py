@@ -95,12 +95,25 @@ def _emit(payload: dict[str, object]) -> None:
     )
 
 
+def _begin_evidence_path(arguments: Sequence[str]) -> Path | None:
+    if not arguments or arguments[0] != "begin":
+        return None
+    for index, argument in enumerate(arguments):
+        if argument == "--prompt-evidence":
+            if index + 1 < len(arguments):
+                return Path(arguments[index + 1])
+            return None
+        if argument.startswith("--prompt-evidence="):
+            value = argument.partition("=")[2]
+            return Path(value) if value else None
+    return None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    evidence_path: Path | None = None
+    raw_arguments = list(sys.argv[1:] if argv is None else argv)
+    evidence_path = _begin_evidence_path(raw_arguments)
     try:
-        arguments = _parser().parse_args(argv)
-        if arguments.command == "begin" and arguments.prompt_evidence is not None:
-            evidence_path = Path(arguments.prompt_evidence)
+        arguments = _parser().parse_args(raw_arguments)
         payload = _dispatch(arguments)
     except (_ArgumentError, InvalidRecorderInput) as exc:
         payload = {
@@ -130,10 +143,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         payload = {
             "ok": False,
             "status": "unavailable",
-            "error": "STATE_CORRUPTION",
+            "error": "RECORDER_UNAVAILABLE",
             "message": str(exc),
         }
-        exit_code = 3
+        exit_code = 0
     except (
         OSError,
         UnicodeError,
