@@ -96,6 +96,36 @@ class Observer:
             )
             self._started = True
             initial_fence = self._current_sequence()
+            active_snapshot = self._active_transaction_snapshot()
+            if active_snapshot is not None:
+                emitted.append(
+                    self._emit(
+                        "recovery_detected",
+                        self._unknown_recovery_payload(
+                            active_snapshot,
+                            reason_code="ACTIVE_TRANSACTION_AT_STARTUP",
+                        ),
+                        observed_at,
+                    )
+                )
+                emitted.append(
+                    self._heartbeat(
+                        active_snapshot,
+                        observed_at,
+                        healthy=False,
+                    )
+                )
+                self._save_state(
+                    _ObserverState(
+                        active_snapshot,
+                        observed_at,
+                        observed_at,
+                        initial_fence,
+                        self._current_sequence(),
+                        True,
+                    )
+                )
+                return emitted
             try:
                 snapshot = capture_snapshot(self.repository, self.store)
             except Exception:
@@ -696,6 +726,42 @@ class Observer:
         finally:
             connection.close()
         return row is not None
+
+    def _active_transaction_snapshot(self) -> GitSnapshot | None:
+        connection = self.store._connect()
+        try:
+            columns = {
+                str(row[1])
+                for row in connection.execute(
+                    "PRAGMA table_info(active_transactions)"
+                ).fetchall()
+            }
+            if "snapshot_json" not in columns:
+                return None
+            row = connection.execute(
+                """
+                SELECT snapshot_json FROM active_transactions
+                WHERE repo_id = ? LIMIT 1
+                """,
+                (self.repo_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        if row is None:
+            return None
+        try:
+            snapshot_data = json.loads(str(row[0]))
+            return GitSnapshot(
+                head=str(snapshot_data["head"]),
+                index_hash=str(snapshot_data["index_hash"]),
+                worktree_hash=str(snapshot_data["worktree_hash"]),
+                files={
+                    str(path): str(reference)
+                    for path, reference in snapshot_data["files"].items()
+                },
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return _unknown_startup_snapshot()
 
     def _current_sequence(self) -> int:
         connection = self.store._connect()

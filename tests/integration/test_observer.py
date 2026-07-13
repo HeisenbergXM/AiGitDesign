@@ -646,6 +646,51 @@ def test_initial_capture_transaction_before_state_save_is_reconciled_not_manual(
     assert len(transaction_patches) == 1
 
 
+def test_initial_tick_uses_active_transaction_start_not_partial_worktree(
+    repo: Path,
+    state_root: Path,
+    clock: FakeClock,
+) -> None:
+    recorder = Recorder(repo, state_root)
+    transaction_id = str(
+        recorder.begin("agent-active-at-observer-start")["transaction_id"]
+    )
+    (repo / "app.py").write_text(
+        "committed = 0\npartial_ai_during_startup = 1\n", encoding="utf-8"
+    )
+    observer = Observer(repo, state_root=state_root)
+
+    startup = observer.tick(clock.now())
+
+    startup_recovery = _only_contribution(startup)
+    assert startup_recovery.event_type == "recovery_detected"
+    assert startup_recovery.payload["classification"] == "UNKNOWN"
+    assert startup_recovery.payload["reason_code"] == (
+        "ACTIVE_TRANSACTION_AT_STARTUP"
+    )
+    assert _events_of_type(startup, "heartbeat")[0].payload["healthy"] is False
+    assert recorder.end(transaction_id, "passed")["ok"] is True
+
+    clock.advance(seconds=10)
+    restarted = Observer(repo, state_root=state_root)
+    restarted.tick(clock.now())
+
+    observer_path_events = [
+        record
+        for record in _ledger_records(repo, state_root)
+        if record["session_id"] == "observer"
+        and record["event_type"] in {"workspace_edit", "recovery_detected"}
+        and record["payload"].get("path") == "app.py"
+    ]
+    assert observer_path_events == []
+    transaction_patches = [
+        record
+        for record in _ledger_records(repo, state_root)
+        if record["event_type"] == "patch_applied"
+    ]
+    assert len(transaction_patches) == 1
+
+
 def test_restart_replays_durable_contribution_boundary_without_double_counting(
     observer: Observer,
     clock: FakeClock,
