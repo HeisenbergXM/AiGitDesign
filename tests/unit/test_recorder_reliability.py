@@ -488,6 +488,102 @@ def test_racing_end_calls_persist_one_contribution_and_terminal(
     assert _event_records(recorder, "recovery_detected") == []
 
 
+def test_expired_takeover_fences_blocked_original_end_owner(
+    recorder: Recorder,
+    repository: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transaction_id = str(
+        _begin_with_evidence(
+            recorder,
+            "session-split-brain",
+            applied_lines=["generated_after_capture = 1"],
+        )["transaction_id"]
+    )
+    (repository / "tracked.py").write_text(
+        "generated_after_capture = 1\n",
+        encoding="utf-8",
+    )
+    original = Recorder(repository, tmp_path / "state")
+    takeover = Recorder(repository, tmp_path / "state")
+    capture_entered = threading.Event()
+    release_original = threading.Event()
+    real_capture = recorder_module.capture_snapshot
+
+    def blocked_capture(*args, **kwargs):
+        capture_entered.set()
+        if not release_original.wait(timeout=3):
+            raise TimeoutError("blocked original owner was not released")
+        return real_capture(*args, **kwargs)
+
+    monkeypatch.setattr(recorder_module, "capture_snapshot", blocked_capture)
+    takeover_claim: dict[str, object] = {}
+    real_execute = takeover._execute_terminal_plan
+
+    def observe_takeover_claim(
+        claimed_transaction_id: str,
+        operation: str,
+        plan,
+    ):
+        with sqlite3.connect(takeover.store.database_path) as connection:
+            row = connection.execute(
+                """
+                SELECT terminal_claim_token, terminal_claim_generation
+                FROM active_transactions
+                WHERE transaction_id = ?
+                """,
+                (claimed_transaction_id,),
+            ).fetchone()
+        assert row is not None
+        takeover_claim["token"] = row[0]
+        takeover_claim["generation"] = row[1]
+        return real_execute(claimed_transaction_id, operation, plan)
+
+    monkeypatch.setattr(takeover, "_execute_terminal_plan", observe_takeover_claim)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        original_result = executor.submit(original.end, transaction_id, "passed")
+        assert capture_entered.wait(timeout=2)
+        try:
+            with sqlite3.connect(recorder.store.database_path) as connection:
+                original_claim = connection.execute(
+                    """
+                    SELECT terminal_claim_token, terminal_claim_generation
+                    FROM active_transactions
+                    WHERE transaction_id = ?
+                    """,
+                    (transaction_id,),
+                ).fetchone()
+            assert original_claim is not None
+            original_token, original_generation = original_claim
+            assert isinstance(original_token, str) and original_token
+            assert isinstance(original_generation, int) and original_generation > 0
+
+            _expire_terminal_claim_lease(recorder, transaction_id)
+            degraded = takeover.end(transaction_id, "passed")
+
+            assert degraded["error"] == "CAPTURE_FAILED"
+            assert degraded["coverage"] == "UNKNOWN"
+            assert isinstance(takeover_claim["token"], str)
+            assert takeover_claim["token"] != original_token
+            assert takeover_claim["generation"] == original_generation + 1
+        finally:
+            release_original.set()
+
+        stale_owner_result = original_result.result(timeout=3)
+
+    assert stale_owner_result == degraded
+    assert stale_owner_result["event_ids"] == degraded["event_ids"]
+    recoveries = _event_records(recorder, "recovery_detected")
+    assert len(recoveries) == 1
+    assert [record["event_id"] for record in recoveries] == degraded["event_ids"]
+    assert _event_records(recorder, "patch_applied") == []
+    assert _event_records(recorder, "transaction_finished") == []
+    fresh = recorder.begin("session-after-split-brain")
+    assert fresh["ok"] is True
+
+
 def test_racing_abort_calls_persist_one_terminal_event(
     recorder: Recorder, repository: Path, tmp_path: Path
 ) -> None:

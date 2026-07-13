@@ -69,6 +69,8 @@ class _ProposedHunk:
 class _TerminalClaim:
     active: _ActiveTransaction
     fresh: bool
+    token: str | None
+    generation: int
 
 
 SQLITE_TIMEOUT_SECONDS = 0.2
@@ -343,7 +345,7 @@ class Recorder:
             after = capture_snapshot(self.repository, self.store)
         except Exception:
             return self._degrade_terminal(
-                active,
+                claimed,
                 operation,
                 "CAPTURE_FAILED",
             )
@@ -351,7 +353,7 @@ class Recorder:
             raw_spans = diff_snapshots(active.snapshot, after, self.store)
         except Exception:
             return self._degrade_terminal(
-                active,
+                claimed,
                 operation,
                 "DIFF_FAILED",
             )
@@ -414,6 +416,8 @@ class Recorder:
             operation,
             _TerminalPlan(tuple(events), result),
             "exact",
+            claimed.token,
+            claimed.generation,
         )
         if isinstance(prepared, dict):
             return prepared
@@ -472,10 +476,11 @@ class Recorder:
 
     def _degrade_terminal(
         self,
-        active: _ActiveTransaction,
+        claim: _TerminalClaim,
         operation: str,
         reason_code: str,
     ) -> dict[str, object]:
+        active = claim.active
         if reason_code == "CAPTURE_FAILED":
             prepared = self._load_terminal_plan(active.transaction_id, operation)
         else:
@@ -486,6 +491,8 @@ class Recorder:
                     operation,
                     proposed,
                     "degraded",
+                    claim.token,
+                    claim.generation,
                 )
             except sqlite3.DatabaseError:
                 prepared = self._load_terminal_plan(active.transaction_id, operation)
@@ -673,6 +680,17 @@ class Recorder:
                 connection.execute(
                     "ALTER TABLE active_transactions "
                     "ADD COLUMN terminal_claim_expires_at TEXT"
+                )
+            if "terminal_claim_token" not in columns:
+                connection.execute(
+                    "ALTER TABLE active_transactions "
+                    "ADD COLUMN terminal_claim_token TEXT"
+                )
+            if "terminal_claim_generation" not in columns:
+                connection.execute(
+                    "ALTER TABLE active_transactions "
+                    "ADD COLUMN terminal_claim_generation "
+                    "INTEGER NOT NULL DEFAULT 0"
                 )
             if "started_event_json" not in columns:
                 connection.execute(
@@ -880,7 +898,8 @@ class Recorder:
                 SELECT transaction_id, repo_id, session_id, started_at,
                        snapshot_json, prompt_evidence_json,
                        terminal_state, terminal_operation, terminal_plan_kind,
-                       terminal_claim_expires_at
+                       terminal_claim_expires_at, terminal_claim_token,
+                       terminal_claim_generation
                 FROM active_transactions
                 WHERE transaction_id = ? AND repo_id = ?
                 """,
@@ -903,9 +922,21 @@ class Recorder:
             claimed_operation = row[7]
             active = self._active_from_row(row)
             fresh = False
+            claim_token: str | None = None
+            claim_generation = 0
             if state == "active":
                 fresh = True
                 if persist_fallback:
+                    if (
+                        not isinstance(row[11], int)
+                        or isinstance(row[11], bool)
+                        or row[11] < 0
+                    ):
+                        raise RecorderStateError(
+                            "terminal claim generation is corrupt"
+                        )
+                    claim_token = uuid4().hex
+                    claim_generation = row[11] + 1
                     fallback = self._degradation_plan(active, "CAPTURE_FAILED")
                     connection.execute(
                         """
@@ -914,13 +945,17 @@ class Recorder:
                             terminal_operation = ?,
                             terminal_plan_json = ?,
                             terminal_plan_kind = 'fallback',
-                            terminal_claim_expires_at = ?
+                            terminal_claim_expires_at = ?,
+                            terminal_claim_token = ?,
+                            terminal_claim_generation = ?
                         WHERE transaction_id = ? AND repo_id = ?
                         """,
                         (
                             operation,
                             self._encode_terminal_plan(fallback),
                             self._new_terminal_claim_expiry(),
+                            claim_token,
+                            claim_generation,
                             transaction_id,
                             self.repo_id,
                         ),
@@ -946,6 +981,10 @@ class Recorder:
                     "counts": {},
                 }
             elif persist_fallback and row[8] == "fallback":
+                current_token, current_generation = self._terminal_claim_identity(
+                    row[10],
+                    row[11],
+                )
                 if not self._terminal_claim_lease_expired(row[9]):
                     connection.commit()
                     return {
@@ -955,25 +994,50 @@ class Recorder:
                         "event_ids": [],
                         "counts": {},
                     }
-                connection.execute(
+                claim_token = uuid4().hex
+                claim_generation = current_generation + 1
+                cursor = connection.execute(
                     """
                     UPDATE active_transactions
-                    SET terminal_claim_expires_at = ?
+                    SET terminal_claim_expires_at = ?,
+                        terminal_claim_token = ?,
+                        terminal_claim_generation = ?
                     WHERE transaction_id = ? AND repo_id = ?
+                      AND terminal_state = 'claimed'
+                      AND terminal_operation = ?
+                      AND terminal_plan_kind = 'fallback'
+                      AND terminal_claim_expires_at = ?
+                      AND terminal_claim_token = ?
+                      AND terminal_claim_generation = ?
                     """,
                     (
                         self._new_terminal_claim_expiry(),
+                        claim_token,
+                        claim_generation,
                         transaction_id,
                         self.repo_id,
+                        operation,
+                        row[9],
+                        current_token,
+                        current_generation,
                     ),
                 )
+                if cursor.rowcount != 1:
+                    raise RecorderStateError(
+                        "terminal fallback claim changed concurrently"
+                    )
+            else:
+                if isinstance(row[10], str):
+                    claim_token = row[10]
+                if isinstance(row[11], int) and not isinstance(row[11], bool):
+                    claim_generation = row[11]
             connection.commit()
         except BaseException:
             connection.rollback()
             raise
         finally:
             connection.close()
-        return _TerminalClaim(active, fresh)
+        return _TerminalClaim(active, fresh, claim_token, claim_generation)
 
     @staticmethod
     def _new_terminal_claim_expiry() -> str:
@@ -995,6 +1059,18 @@ class Recorder:
         if expires_at.tzinfo is None or expires_at.utcoffset() is None:
             raise RecorderStateError("terminal fallback claim lease is corrupt")
         return expires_at <= datetime.now(timezone.utc)
+
+    @staticmethod
+    def _terminal_claim_identity(token: object, generation: object) -> tuple[str, int]:
+        if not isinstance(token, str) or not token:
+            raise RecorderStateError("terminal fallback claim identity is corrupt")
+        if (
+            not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or generation <= 0
+        ):
+            raise RecorderStateError("terminal fallback claim identity is corrupt")
+        return token, generation
 
     def _active_from_row(self, row: tuple[object, ...]) -> _ActiveTransaction:
         if not isinstance(row[4], str):
@@ -1104,6 +1180,8 @@ class Recorder:
         operation: str,
         proposed: _TerminalPlan,
         plan_kind: str,
+        expected_token: str | None,
+        expected_generation: int,
     ) -> _TerminalPlan | dict[str, object]:
         encoded = self._encode_terminal_plan(proposed)
         connection = self._connect()
@@ -1111,7 +1189,8 @@ class Recorder:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 """
-                SELECT terminal_operation, terminal_plan_json, terminal_plan_kind
+                SELECT terminal_operation, terminal_plan_json, terminal_plan_kind,
+                       terminal_claim_token, terminal_claim_generation
                 FROM active_transactions
                 WHERE transaction_id = ? AND repo_id = ?
                 """,
@@ -1137,21 +1216,44 @@ class Recorder:
                     "counts": {},
                 }
             if row[2] == "fallback":
-                connection.execute(
-                    """
-                    UPDATE active_transactions
-                    SET terminal_plan_json = ?, terminal_plan_kind = ?,
-                        terminal_claim_expires_at = NULL
-                    WHERE transaction_id = ? AND repo_id = ?
-                    """,
-                    (
-                        encoded,
-                        plan_kind,
-                        transaction_id,
-                        self.repo_id,
-                    ),
+                current_token, current_generation = self._terminal_claim_identity(
+                    row[3],
+                    row[4],
                 )
-                selected = proposed
+                if (
+                    expected_token != current_token
+                    or expected_generation != current_generation
+                ):
+                    if not isinstance(row[1], str):
+                        raise RecorderStateError("terminal plan state is corrupt")
+                    selected = self._decode_terminal_plan(row[1])
+                else:
+                    cursor = connection.execute(
+                        """
+                        UPDATE active_transactions
+                        SET terminal_plan_json = ?, terminal_plan_kind = ?,
+                            terminal_claim_expires_at = NULL
+                        WHERE transaction_id = ? AND repo_id = ?
+                          AND terminal_operation = ?
+                          AND terminal_plan_kind = 'fallback'
+                          AND terminal_claim_token = ?
+                          AND terminal_claim_generation = ?
+                        """,
+                        (
+                            encoded,
+                            plan_kind,
+                            transaction_id,
+                            self.repo_id,
+                            operation,
+                            expected_token,
+                            expected_generation,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise RecorderStateError(
+                            "terminal fallback claim changed concurrently"
+                        )
+                    selected = proposed
             elif isinstance(row[1], str):
                 selected = self._decode_terminal_plan(row[1])
             else:
